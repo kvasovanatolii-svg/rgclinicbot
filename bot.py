@@ -1,19 +1,56 @@
 # bot.py — МедНавигатор РГ Клиник (inline-меню)
-# Требования: python-telegram-bot==20.8
+# Требования: python-telegram-bot==20.8, gspread, google-auth, python-dateutil
 
 import os
+import json
 import logging
+from datetime import datetime
+from dateutil.parser import parse as dt_parse, ParserError
+
+import gspread
+from google.oauth2.service_account import Credentials
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
+SHEET_NAME     = os.getenv("GOOGLE_SHEET_NAME", "Requests")
+SA_JSON        = os.getenv("GOOGLE_SERVICE_ACCOUNT")  # весь JSON сервисного аккаунта
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
 
-# --- Тексты ---
+# ==== Google Sheets client ====
+def get_gs_client():
+    if not SA_JSON:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT не задан")
+    info = json.loads(SA_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
+
+def append_booking_row(values: list):
+    if not SPREADSHEET_ID:
+        raise RuntimeError("GOOGLE_SPREADSHEET_ID не задан")
+
+    gc = get_gs_client()
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = None
+    try:
+        ws = sh.worksheet(SHEET_NAME)
+    except Exception:
+        ws = sh.sheet1  # fallback на первый лист
+
+    ws.append_row(values, value_input_option="USER_ENTERED")
+
+# ==== Тексты ====
 WELCOME_TEXT = (
     "👋 Здравствуйте!\n\n"
     "Я — МедНавигатор РГ Клиник, ваш цифровой помощник.\n"
@@ -26,10 +63,10 @@ HELP_TEXT = (
     "• записаться к врачу\n"
     "• подготовиться к обследованиям\n"
     "• получить контакты клиник\n\n"
-    "Нажмите нужную кнопку ниже или команду /menu."
+    "Нажмите /menu или выберите кнопку."
 )
 
-# --- Кнопки меню ---
+# ==== Кнопки ====
 BTN_PRICES   = "🧾 Цены и анализы"
 BTN_RECORD   = "📅 Запись на приём"
 BTN_CONTACTS = "📍 Контакты"
@@ -49,7 +86,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(rows)
 
-# --- Команды ---
+# ==== Команды ====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME_TEXT, reply_markup=main_menu_kb())
 
@@ -59,11 +96,11 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
 
-# --- Обработчик нажатий на кнопки ---
+# ==== Обработчик меню ====
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
-    await query.answer()  # короткий ответ клиенту (обязателен для UX)
+    await query.answer()
 
     if data == CB_PRICES:
         text = (
@@ -77,16 +114,13 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "📅 *Запись на приём*\n"
             "Отправьте в одном сообщении:\n"
-            "*ФИО пациента, телефон, врач/специализация, дата (ГГГГ-ММ-ДД), время (ЧЧ:ММ)*\n"
+            "*ФИО, телефон, врач/специализация, дата (ГГГГ-ММ-ДД), время (ЧЧ:ММ)*\n"
             "_Пример: Иванов И.И., +7..., Терапевт, 2025-10-25, 14:30_"
         )
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
 
     elif data == CB_PREP:
-        text = (
-            "ℹ️ *Подготовка к обследованиям*\n"
-            "Напишите название анализа/исследования — отправлю памятку по подготовке."
-        )
+        text = "ℹ️ *Подготовка к обследованиям*\nНапишите название анализа — пришлю памятку."
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
 
     elif data == CB_CONTACTS:
@@ -98,14 +132,68 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
 
-# --- Фолбэк для произвольного текста (пока заглушка) ---
+# ==== Парсер записи ====
+def parse_booking(text: str):
+    # ожидаем: ФИО, телефон, врач, дата, время
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) < 5:
+        return None, "Сообщение должно содержать 5 полей через запятую: ФИО, телефон, врач, дата (ГГГГ-ММ-ДД), время (ЧЧ:ММ)."
+
+    fio, phone, doctor, date_s, time_s = parts[:5]
+    # базовые проверки даты/времени
+    try:
+        dt = dt_parse(f"{date_s} {time_s}")
+    except ParserError:
+        return None, "Не распознал дату/время. Формат: 2025-10-25, 14:30."
+
+    return {
+        "fio": fio,
+        "phone": phone,
+        "doctor": doctor,
+        "date": dt.date().isoformat(),
+        "time": dt.strftime("%H:%M"),
+    }, None
+
+# ==== Фолбэк: запись в таблицу ====
 async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
+    user = update.effective_user
     logging.info("Запрос: %s", txt)
-    await update.message.reply_text(
-        "Принял запрос 👍 Скоро подключу поиск по прайсу и запись в расписание.",
-        reply_markup=main_menu_kb()
-    )
+
+    # пробуем распарсить как запись
+    data, err = parse_booking(txt)
+    if err:
+        await update.message.reply_text(
+            "Принял запрос 👍\n"
+            "Чтобы записать на приём, введите в одном сообщении:\n"
+            "ФИО, телефон, врач, 2025-10-25, 14:30",
+            reply_markup=main_menu_kb()
+        )
+        return
+
+    # формируем строку и пишем в таблицу
+    values = [
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        str(user.id) if user else "",
+        user.full_name if user else "",
+        data["fio"],
+        data["phone"],
+        data["doctor"],
+        data["date"],
+        data["time"],
+        "Новая",  # статус заявки
+    ]
+
+    try:
+        append_booking_row(values)
+        await update.message.reply_text("📝 Заявка принята, администратор свяжется с вами. Спасибо!", reply_markup=main_menu_kb())
+    except Exception as e:
+        logging.exception("Ошибка записи в Google Sheets")
+        await update.message.reply_text(
+            "⚠️ Не удалось записать в таблицу. Передам администратору.\n"
+            "Сообщение отправлено в лог.",
+            reply_markup=main_menu_kb()
+        )
 
 def main():
     if not BOT_TOKEN:
@@ -121,7 +209,7 @@ def main():
     # Инлайн-кнопки
     app.add_handler(CallbackQueryHandler(on_menu_click))
 
-    # Любой текст
+    # Любой текст → попытка записи в таблицу
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
 
     logging.info("Бот запускается (polling)…")
@@ -129,5 +217,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
