@@ -11,44 +11,21 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder, Application, CommandHandler,
+    CallbackQueryHandler, MessageHandler, ContextTypes, filters
+)
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
-SHEET_NAME     = os.getenv("GOOGLE_SHEET_NAME", "Requests")
-SA_JSON        = os.getenv("GOOGLE_SERVICE_ACCOUNT")  # весь JSON сервисного аккаунта
+# ==== Конфигурация ====
+BOT_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN")
+SPREADSHEET_ID  = os.getenv("GOOGLE_SPREADSHEET_ID")              # 12MrsPstgArUxiSCErzJD3zyw6npXv_LcSJ7HLlIXbw4
+SHEET_NAME      = os.getenv("GOOGLE_SHEET_NAME", "Requests")      # имя листа
+SA_JSON         = os.getenv("GOOGLE_SERVICE_ACCOUNT")             # весь JSON сервисного аккаунта (одной строкой)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
-
-# ==== Google Sheets client ====
-def get_gs_client():
-    if not SA_JSON:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT не задан")
-    info = json.loads(SA_JSON)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
-
-def append_booking_row(values: list):
-    if not SPREADSHEET_ID:
-        raise RuntimeError("GOOGLE_SPREADSHEET_ID не задан")
-
-    gc = get_gs_client()
-    sh = gc.open_by_key(SPREADSHEET_ID)
-    ws = None
-    try:
-        ws = sh.worksheet(SHEET_NAME)
-    except Exception:
-        ws = sh.sheet1  # fallback на первый лист
-
-    ws.append_row(values, value_input_option="USER_ENTERED")
 
 # ==== Тексты ====
 WELCOME_TEXT = (
@@ -56,7 +33,6 @@ WELCOME_TEXT = (
     "Я — МедНавигатор РГ Клиник, ваш цифровой помощник.\n"
     "Выберите раздел ниже:"
 )
-
 HELP_TEXT = (
     "ℹ️ Я помогу:\n"
     "• узнать цены и сроки анализов\n"
@@ -81,10 +57,34 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(BTN_PRICES, callback_data=CB_PRICES)],
         [InlineKeyboardButton(BTN_RECORD, callback_data=CB_RECORD)],
-        [InlineKeyboardButton(BTN_PREP, callback_data=CB_PREP)],
+        [InlineKeyboardButton(BTN_PREP,   callback_data=CB_PREP)],
         [InlineKeyboardButton(BTN_CONTACTS, callback_data=CB_CONTACTS)],
     ]
     return InlineKeyboardMarkup(rows)
+
+# ==== Google Sheets helpers ====
+def _gs_client():
+    if not SA_JSON:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT не задан")
+    info = json.loads(SA_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
+
+def append_booking_row(values: list):
+    """Добавляет одну строку в конец листа."""
+    if not SPREADSHEET_ID:
+        raise RuntimeError("GOOGLE_SPREADSHEET_ID не задан")
+    gc = _gs_client()
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        ws = sh.worksheet(SHEET_NAME)
+    except Exception:
+        ws = sh.sheet1
+    ws.append_row(values, value_input_option="USER_ENTERED")
 
 # ==== Команды ====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,33 +134,28 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==== Парсер записи ====
 def parse_booking(text: str):
-    # ожидаем: ФИО, телефон, врач, дата, время
+    # ожидаем: ФИО, телефон, врач, дата, время (через запятую)
     parts = [p.strip() for p in text.split(",")]
     if len(parts) < 5:
-        return None, "Сообщение должно содержать 5 полей через запятую: ФИО, телефон, врач, дата (ГГГГ-ММ-ДД), время (ЧЧ:ММ)."
-
+        return None, "Нужно 5 полей: ФИО, телефон, врач, дата (ГГГГ-ММ-ДД), время (ЧЧ:ММ)."
     fio, phone, doctor, date_s, time_s = parts[:5]
-    # базовые проверки даты/времени
     try:
         dt = dt_parse(f"{date_s} {time_s}")
     except ParserError:
-        return None, "Не распознал дату/время. Формат: 2025-10-25, 14:30."
-
+        return None, "Не распознал дату/время. Пример: 2025-10-25, 14:30."
     return {
         "fio": fio,
         "phone": phone,
         "doctor": doctor,
-        "date": dt.date().isoformat(),
-        "time": dt.strftime("%H:%M"),
+        "date": dt.date().isoformat(),    # YYYY-MM-DD
+        "time": dt.strftime("%H:%M"),     # HH:MM
     }, None
 
-# ==== Фолбэк: запись в таблицу ====
+# ==== Любой текст → попытка записи ====
 async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
-    user = update.effective_user
-    logging.info("Запрос: %s", txt)
+    logging.info("Входящее сообщение: %s", txt)
 
-    # пробуем распарсить как запись
     data, err = parse_booking(txt)
     if err:
         await update.message.reply_text(
@@ -171,49 +166,73 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # формируем строку и пишем в таблицу
+    # Порядок колонок: A..H
+    appointment_id   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    patient_full_name= data["fio"]
+    patient_phone    = data["phone"]
+    doctor_full_name = data["doctor"]
+    date_iso         = data["date"]
+    time_hm          = data["time"]
+    datetime_iso     = f"{date_iso}T{time_hm}:00"
+    status           = "Новая"
+
     values = [
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        str(user.id) if user else "",
-        user.full_name if user else "",
-        data["fio"],
-        data["phone"],
-        data["doctor"],
-        data["date"],
-        data["time"],
-        "Новая",  # статус заявки
+        appointment_id,      # A appointment_id
+        patient_full_name,   # B patient_full_name
+        patient_phone,       # C patient_phone
+        doctor_full_name,    # D doctor_full_name
+        date_iso,            # E date
+        time_hm,             # F time
+        datetime_iso,        # G datetime_iso
+        status,              # H status
     ]
 
     try:
         append_booking_row(values)
-        await update.message.reply_text("📝 Заявка принята, администратор свяжется с вами. Спасибо!", reply_markup=main_menu_kb())
+        await update.message.reply_text(
+            "📝 Заявка принята, администратор свяжется с вами. Спасибо!",
+            reply_markup=main_menu_kb()
+        )
     except Exception as e:
         logging.exception("Ошибка записи в Google Sheets")
         await update.message.reply_text(
-            "⚠️ Не удалось записать в таблицу. Передам администратору.\n"
-            "Сообщение отправлено в лог.",
+            "⚠️ Не удалось записать в таблицу. Передам администратору.",
             reply_markup=main_menu_kb()
         )
+
+# ==== Инициализация приложения ====
+async def _post_init(app: Application):
+    # Убираем возможный webhook и сбрасываем хвост апдейтов перед polling
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logging.info("Webhook удалён, pending updates сброшены")
+    except Exception:
+        logging.exception("Не удалось удалить webhook")
 
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❗ Переменная TELEGRAM_BOT_TOKEN не задана")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
 
     # Команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("menu",  menu))
+    app.add_handler(CommandHandler("help",  help_command))
 
     # Инлайн-кнопки
     app.add_handler(CallbackQueryHandler(on_menu_click))
 
-    # Любой текст → попытка записи в таблицу
+    # Любой текст → запись
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
 
     logging.info("Бот запускается (polling)…")
-    app.run_polling()
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
