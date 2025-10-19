@@ -1,1 +1,4 @@
 python-telegram-bot==20.8
+gspread==6.1.2
+google-auth==2.34.0
+python-dateutil==2.9.0.post0
