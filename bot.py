@@ -1,11 +1,5 @@
-# bot.py — МедНавигатор РГ Клиник (v2 Render Edition)
-# ----------------------------------------------------
-# ✅ Работает через polling
-# ✅ Автоматически создаёт шапки в Google Sheets (/init_sheets)
-# ✅ Поддержка записи к врачу, прайс-листов и памяток
-# ✅ Кнопки: «Ещё слоты», «На другой день»
-# ✅ Отмена записи: /cancel_booking <slot_id>
-# ✅ Уведомление администратора через ADMIN_CHAT_ID
+# bot.py — МедНавигатор РГ Клиник (Render Edition Stable)
+# Версия без ошибок отступов, с глобальной обработкой ошибок и уведомлением админа.
 
 import os
 import re
@@ -17,11 +11,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, Application, CommandHandler, CallbackQueryHandler,
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ConversationHandler, ContextTypes, filters
 )
 
-# --- Настройки из окружения ---
+# === Настройки окружения ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
 SERVICE_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT")
@@ -34,7 +28,7 @@ PREP_SHEET = "Prep"
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 
-# --- Интерфейс ---
+# === Интерфейс ===
 WELCOME = "👋 Здравствуйте! Я — МедНавигатор РГ Клиник.\nВыберите раздел ниже:"
 HELP = "ℹ️ Команды:\n/start — начать\n/menu — меню\n/init_sheets — создать таблицы\n/cancel_booking <slot_id> — снять бронь"
 
@@ -51,9 +45,9 @@ def main_menu():
         [InlineKeyboardButton(BTN_CONTACTS, callback_data="CONTACTS")],
     ])
 
-# --- Google Sheets ---
+# === Google Sheets ===
 def gs_client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(json.loads(SERVICE_JSON), scopes=scopes)
     return gspread.authorize(creds)
 
@@ -87,16 +81,17 @@ def ensure_headers():
             created.append(sheet)
     return created
 
-# --- Вспомогательные функции ---
+# === Вспомогательные функции ===
 def read_all(ws):
     vals = ws.get_all_values()
-    if not vals: return [], []
+    if not vals:
+        return [], []
     return vals[0], vals[1:]
 
 def header_map(header):
     return {re.sub(r'[^a-z0-9а-я]', '', h.strip().lower()): i for i, h in enumerate(header)}
 
-# --- Schedule logic ---
+# === Schedule logic ===
 def find_free_slots(query, page=0, page_size=3, date_filter=None):
     ws = open_ws(SCHEDULE_SHEET)
     header, data = read_all(ws)
@@ -106,7 +101,8 @@ def find_free_slots(query, page=0, page_size=3, date_filter=None):
     for row in data:
         try:
             st = row[hm.get("status", -1)].upper()
-            if st != "FREE": continue
+            if st != "FREE":
+                continue
             doc = row[hm.get("doctor_name", -1)]
             sp = row[hm.get("specialty", -1)]
             if query.lower() not in doc.lower() and query.lower() not in sp.lower():
@@ -114,7 +110,8 @@ def find_free_slots(query, page=0, page_size=3, date_filter=None):
             dt = dt_parse(f"{row[hm.get('date', -1)]} {row[hm.get('time', -1)]}")
             if date_filter and row[hm.get("date", -1)] != date_filter:
                 continue
-            if dt < now: continue
+            if dt < now:
+                continue
             result.append({
                 "slot_id": row[hm.get("slot_id", -1)],
                 "doctor_name": doc,
@@ -135,8 +132,10 @@ def update_slot(slot_id, status, fio="", phone=""):
         if row[hm.get("slot_id", -1)] == slot_id:
             new = row.copy()
             new[hm["status"]] = status
-            if "patient_full_name" in hm: new[hm["patient_full_name"]] = fio
-            if "patient_phone" in hm: new[hm["patient_phone"]] = phone
+            if "patient_full_name" in hm:
+                new[hm["patient_full_name"]] = fio
+            if "patient_phone" in hm:
+                new[hm["patient_phone"]] = phone
             ws.update(f"A{i}:L{i}", [new])
             return True
     return False
@@ -144,11 +143,12 @@ def update_slot(slot_id, status, fio="", phone=""):
 def add_request(fio, phone, doctor, date, time):
     ws = open_ws(REQUESTS_SHEET)
     header, _ = read_all(ws)
-    if not header: ws.append_row(["appointment_id","patient_full_name","patient_phone","doctor_full_name","date","time","datetime_iso","status"])
+    if not header:
+        ws.append_row(["appointment_id","patient_full_name","patient_phone","doctor_full_name","date","time","datetime_iso","status"])
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws.append_row([now, fio, phone, doctor, date, time, f"{date}T{time}:00", "Новая"])
 
-# --- Telegram logic ---
+# === Telegram logic ===
 ASK_DOCTOR, ASK_SLOT, ASK_FIO, ASK_PHONE, ASK_DATE = range(5)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,9 +171,8 @@ async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Не удалось отменить (проверьте slot_id).")
 
-# --- FSM: запись ---
 async def record_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message  # вместо update.message
+    msg = update.effective_message
     await msg.reply_text("Введите врача или специализацию:")
     return ASK_DOCTOR
 
@@ -240,37 +239,30 @@ async def record_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Запись подтверждена для {fio}.", reply_markup=main_menu())
     return ConversationHandler.END
 
-# --- Запуск ---
+# === Запуск ===
 def build_app():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # --- FSM записи ---
     conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(lambda u, c: record_start(u, c), pattern="RECORD"),
-            MessageHandler(filters.Regex("^📅 Запись на приём$"), record_start),
-        ],
+        entry_points=[CallbackQueryHandler(lambda u, c: record_start(u, c), pattern="RECORD"),
+                      MessageHandler(filters.Regex("^📅 Запись на приём$"), record_start)],
         states={
             ASK_DOCTOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, record_doctor)],
-            ASK_SLOT:   [CallbackQueryHandler(record_slot)],
-            ASK_DATE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, record_date)],
-            ASK_FIO:    [MessageHandler(filters.TEXT & ~filters.COMMAND, record_fio)],
-            ASK_PHONE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, record_phone)],
+            ASK_SLOT: [CallbackQueryHandler(record_slot)],
+            ASK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, record_date)],
+            ASK_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, record_fio)],
+            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, record_phone)],
         },
         fallbacks=[],
-        allow_reentry=True,
+        allow_reentry=True
     )
 
-    # --- Команды ---
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", lambda u, c: u.message.reply_text(HELP)))
     app.add_handler(CommandHandler("init_sheets", init_sheets))
     app.add_handler(CommandHandler("cancel_booking", cancel_booking))
-
-    # --- Регистрация FSM ---
     app.add_handler(conv)
 
-    # --- Глобальный обработчик ошибок ---
     async def error_handler(update, context):
         logging.exception("Unhandled exception", exc_info=context.error)
         if ADMIN_CHAT_ID:
@@ -286,3 +278,16 @@ def build_app():
 
     return app
 
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("❗ TELEGRAM_BOT_TOKEN не задан")
+    if not SPREADSHEET_ID:
+        raise SystemExit("❗ GOOGLE_SPREADSHEET_ID не задан")
+    if not SERVICE_JSON:
+        raise SystemExit("❗ GOOGLE_SERVICE_ACCOUNT не задан")
+    app = build_app()
+    logging.info("Бот запускается (polling)…")
+    app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()
