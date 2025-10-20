@@ -171,45 +171,61 @@ def find_free_slots(query: str, page: int = 0, page_size: int = 3, date_filter: 
 def update_slot(slot_id: str, status: str, fio: str = "", phone: str = "") -> bool:
     ws = open_ws(SCHEDULE_SHEET)
     header, data = read_all(ws)
-    if not header: return False
-    hm = header_map(header)
+    if not header:
+        return False
 
-    idx_slot   = hm.get("slot_id")
-    idx_status = hm.get("status")
-    idx_fio    = hm.get("patient_full_name")
-    idx_phone  = hm.get("patient_phone")
-    idx_upd    = hm.get("updated_at")
+    hm = header_map(header)
+    norm = lambda s: re.sub(r'[^a-z0-9а-я]', '', s)
+
+    idx_slot   = hm.get(norm("slot_id"))
+    idx_status = hm.get(norm("status"))
+    idx_fio    = hm.get(norm("patient_full_name"))
+    idx_phone  = hm.get(norm("patient_phone"))
+    idx_upd    = hm.get(norm("updated_at"))
 
     for i, r in enumerate(data, start=2):
-        if idx_slot is not None and r[idx_slot] == slot_id:
+        if idx_slot is not None and idx_slot < len(r) and r[idx_slot] == slot_id:
             row = r[:]
-            if idx_status is not None: row[idx_status] = status
-            if idx_fio is not None:    row[idx_fio]    = fio
-            if idx_phone is not None:  row[idx_phone]  = phone
-            if idx_upd is not None:    row[idx_upd]    = datetime.now().isoformat(timespec="seconds")
             # растянуть до длины шапки
             while len(row) < len(header):
                 row.append("")
-            ws.update(f"A{i}:{chr(64+len(header))}{i}", [row])
+            if idx_status is not None:
+                row[idx_status] = status
+            if idx_fio is not None:
+                row[idx_fio] = fio
+            if idx_phone is not None:
+                row[idx_phone] = phone
+            if idx_upd is not None:
+                row[idx_upd] = datetime.now().isoformat(timespec="seconds")
+
+            # обновляем всю строку
+            ws.update(f"A{i}:{chr(64 + len(header))}{i}", [row])
             return True
+
     return False
+
 
 def get_slot_info(slot_id: str) -> dict:
     ws = open_ws(SCHEDULE_SHEET)
     header, data = read_all(ws)
     hm = header_map(header)
-    idx_slot = hm.get("slot_id")
+    norm = lambda s: re.sub(r'[^a-z0-9а-я]', '', s)
+
+    idx_slot = hm.get(norm("slot_id"))
+
     def gv(row, name):
-        j = hm.get(name); 
+        j = hm.get(norm(name))
         return row[j] if j is not None and j < len(row) else ""
+
     for r in data:
-        if idx_slot is not None and r[idx_slot] == slot_id:
+        if idx_slot is not None and idx_slot < len(r) and r[idx_slot] == slot_id:
             return {
                 "doctor_full_name": gv(r, "doctor_name"),
                 "date": gv(r, "date"),
                 "time": gv(r, "time"),
             }
     return {"doctor_full_name": "", "date": "", "time": ""}
+
 
 def append_request(fio: str, phone: str, doctor: str, date: str, time: str):
     ws = open_ws(REQUESTS_SHEET)
@@ -441,4 +457,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
