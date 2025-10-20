@@ -266,7 +266,7 @@ def build_app():
         logging.exception("Unhandled exception", exc_info=context.error)
 
     app.add_error_handler(error_handler)
- return app
+return app
 
 def main():
     if not BOT_TOKEN: raise SystemExit("❗ TELEGRAM_BOT_TOKEN не задан")
@@ -278,4 +278,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
