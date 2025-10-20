@@ -173,7 +173,8 @@ async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- FSM: запись ---
 async def record_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введите врача или специализацию:")
+    msg = update.effective_message  # вместо update.message
+    await msg.reply_text("Введите врача или специализацию:")
     return ASK_DOCTOR
 
 async def record_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -260,7 +261,12 @@ def build_app():
     app.add_handler(CommandHandler("init_sheets", init_sheets))
     app.add_handler(CommandHandler("cancel_booking", cancel_booking))
     app.add_handler(conv)
-    return app
+       # --- Глобальный обработчик ошибок ---
+    async def error_handler(update, context):
+        logging.exception("Unhandled exception", exc_info=context.error)
+
+    app.add_error_handler(error_handler)
+ return app
 
 def main():
     if not BOT_TOKEN: raise SystemExit("❗ TELEGRAM_BOT_TOKEN не задан")
@@ -272,3 +278,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
