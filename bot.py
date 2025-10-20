@@ -243,40 +243,46 @@ async def record_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Запуск ---
 def build_app():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # --- FSM записи ---
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(lambda u,c: record_start(u,c), pattern="RECORD"),
-                      MessageHandler(filters.Regex("^📅 Запись на приём$"), record_start)],
+        entry_points=[
+            CallbackQueryHandler(lambda u, c: record_start(u, c), pattern="RECORD"),
+            MessageHandler(filters.Regex("^📅 Запись на приём$"), record_start),
+        ],
         states={
             ASK_DOCTOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, record_doctor)],
-            ASK_SLOT: [CallbackQueryHandler(record_slot)],
-            ASK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, record_date)],
-            ASK_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, record_fio)],
-            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, record_phone)],
+            ASK_SLOT:   [CallbackQueryHandler(record_slot)],
+            ASK_DATE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, record_date)],
+            ASK_FIO:    [MessageHandler(filters.TEXT & ~filters.COMMAND, record_fio)],
+            ASK_PHONE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, record_phone)],
         },
         fallbacks=[],
-        allow_reentry=True
+        allow_reentry=True,
     )
+
+    # --- Команды ---
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", lambda u,c: u.message.reply_text(HELP)))
+    app.add_handler(CommandHandler("help", lambda u, c: u.message.reply_text(HELP)))
     app.add_handler(CommandHandler("init_sheets", init_sheets))
     app.add_handler(CommandHandler("cancel_booking", cancel_booking))
+
+    # --- Регистрация FSM ---
     app.add_handler(conv)
-       # --- Глобальный обработчик ошибок ---
+
+    # --- Глобальный обработчик ошибок ---
     async def error_handler(update, context):
         logging.exception("Unhandled exception", exc_info=context.error)
+        if ADMIN_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(ADMIN_CHAT_ID),
+                    text=f"⚠️ Ошибка: {context.error}"
+                )
+            except Exception:
+                pass
 
     app.add_error_handler(error_handler)
-return app
 
-def main():
-    if not BOT_TOKEN: raise SystemExit("❗ TELEGRAM_BOT_TOKEN не задан")
-    if not SPREADSHEET_ID: raise SystemExit("❗ GOOGLE_SPREADSHEET_ID не задан")
-    if not SERVICE_JSON: raise SystemExit("❗ GOOGLE_SERVICE_ACCOUNT не задан")
-    app = build_app()
-    logging.info("Бот запускается (polling)…")
-    app.run_polling(close_loop=False)
-
-if __name__ == "__main__":
-    main()
-
+    return app
 
