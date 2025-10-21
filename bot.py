@@ -1,12 +1,11 @@
-# bot.py — МедНавигатор РГ Клиник (Full v4)
+# bot.py — МедНавигатор РГ Клиник (Full v5)
 # --------------------------------------------------------------
 # ✔ Запись на приём (FREE → BOOKED), пагинация, фильтр по дате
 # ✔ Автошапки листов: /init_sheets и /fix_headers
 # ✔ Диагностика: /debug_slots [запрос]
-# ✔ Инфо-справка 24/7 из Google Sheet (лист Info)
-#     /hours /manager /promos /services /contacts
+# ✔ Инфо-справка 24/7 из листа Info
 # ✔ Поиск по Price/Prep (кнопки и свободный текст)
-# ✔ Карточки врача из листа Doctors: /doctor <фамилия|специальность>
+# ✔ Карточки врача из листа Doctors: /doctor и естественные фразы
 # ✔ Антиконфликт polling: снятие вебхука, подавление спама ошибок
 # Требования: python-telegram-bot==20.8, gspread, google-auth, python-dateutil
 
@@ -73,7 +72,7 @@ HEADERS = {
     PRICES_SHEET:   ["code","name","price","tat_days","notes"],
     PREP_SHEET:     ["test_name","memo"],
     INFO_SHEET:     ["key","value"],
-    # Doctors: создаётся вручную CSV/импортом (ФИО, Специальность, Стаж, Сертификаты, График приёма, Кабинет, Краткое био)
+    # DOCTORS_SHEET создаётся импортом: ФИО, Специальность, Стаж, Сертификаты, График приёма, Кабинет, Краткое био
 }
 
 def gs_client():
@@ -129,7 +128,6 @@ def read_all(ws):
     return vals[0], vals[1:]
 
 def header_map(header):
-    # Нормализуем: нижний регистр + убираем всё, кроме лат/цифр/рус
     return {re.sub(r'[^a-z0-9а-я]', '', h.strip().lower()): i for i, h in enumerate(header)}
 
 # --------- Schedule ops ----------
@@ -138,78 +136,54 @@ def find_free_slots(query: str, page: int = 0, page_size: int = 3, date_filter: 
     header, data = read_all(ws)
     if not header: return []
     hm = header_map(header)
+    col = lambda n: hm.get(re.sub(r'[^a-z0-9а-я]','',n))
 
-    def col(name: str) -> int | None:
-        return hm.get(re.sub(r'[^a-z0-9а-я]', '', name))
-
-    idx_status = col("status")
-    idx_doc    = col("doctor_name")
-    idx_spec   = col("specialty")
-    idx_date   = col("date")
-    idx_time   = col("time")
-    idx_slot   = col("slot_id")
+    idx_status = col("status"); idx_doc = col("doctor_name"); idx_spec = col("specialty")
+    idx_date = col("date"); idx_time = col("time"); idx_slot = col("slot_id")
 
     q = (query or "").strip().lower()
     now = datetime.now()
     pool = []
-
     for r in data:
         try:
-            if idx_status is None or r[idx_status].strip().upper() != "FREE":
-                continue
+            if idx_status is None or r[idx_status].strip().upper() != "FREE": continue
             doc = r[idx_doc] if idx_doc is not None and idx_doc < len(r) else ""
             sp  = r[idx_spec] if idx_spec is not None and idx_spec < len(r) else ""
-            if q and (q not in str(doc).lower()) and (q not in str(sp).lower()):
-                continue
+            if q and (q not in str(doc).lower()) and (q not in str(sp).lower()): continue
             d = r[idx_date] if idx_date is not None and idx_date < len(r) else ""
             t = r[idx_time] if idx_time is not None and idx_time < len(r) else ""
-            if not d or not t:
-                continue
-            if date_filter and d != date_filter:
-                continue
-            dt = dt_parse(f"{d} {t}")
-            if dt < now:
-                continue
+            if not d or not t: continue
+            if date_filter and d != date_filter: continue
+            if dt_parse(f"{d} {t}") < now: continue
             pool.append({
                 "slot_id": r[idx_slot] if idx_slot is not None and idx_slot < len(r) else "",
-                "doctor_name": doc,
-                "specialty": sp,
-                "date": d,
-                "time": t,
+                "doctor_name": doc, "specialty": sp, "date": d, "time": t
             })
         except Exception:
             continue
-
     start = page * page_size
-    end = start + page_size
-    return pool[start:end]
+    return pool[start:start+page_size]
 
 def update_slot(slot_id: str, status: str, fio: str = "", phone: str = "") -> bool:
     ws = open_ws(SCHEDULE_SHEET)
     header, data = read_all(ws)
     if not header: return False
-
     hm = header_map(header)
     norm = lambda s: re.sub(r'[^a-z0-9а-я]', '', s)
 
-    idx_slot   = hm.get(norm("slot_id"))
-    idx_status = hm.get(norm("status"))
-    idx_fio    = hm.get(norm("patient_full_name"))
-    idx_phone  = hm.get(norm("patient_phone"))
-    idx_upd    = hm.get(norm("updated_at"))
+    idx_slot = hm.get(norm("slot_id")); idx_status = hm.get(norm("status"))
+    idx_fio = hm.get(norm("patient_full_name")); idx_phone = hm.get(norm("patient_phone"))
+    idx_upd = hm.get(norm("updated_at"))
 
     for i, r in enumerate(data, start=2):
         if idx_slot is not None and idx_slot < len(r) and r[idx_slot] == slot_id:
             row = r[:]
-            while len(row) < len(header):
-                row.append("")
+            while len(row) < len(header): row.append("")
             if idx_status is not None: row[idx_status] = status
             if idx_fio    is not None: row[idx_fio]    = fio
             if idx_phone  is not None: row[idx_phone]  = phone
             if idx_upd    is not None: row[idx_upd]    = datetime.now().isoformat(timespec="seconds")
-
-            # Обновляем A..(len(header)) для этой строки
-            end_col = chr(64 + len(header))  # до L при 12 колонках
+            end_col = chr(64 + len(header))
             ws.update(f"A{i}:{end_col}{i}", [row])
             return True
     return False
@@ -217,36 +191,24 @@ def update_slot(slot_id: str, status: str, fio: str = "", phone: str = "") -> bo
 def get_slot_info(slot_id: str) -> dict:
     ws = open_ws(SCHEDULE_SHEET)
     header, data = read_all(ws)
-    hm = header_map(header)
-    norm = lambda s: re.sub(r'[^a-z0-9а-я]', '', s)
+    hm = header_map(header); norm = lambda s: re.sub(r'[^a-z0-9а-я]', '', s)
     idx_slot = hm.get(norm("slot_id"))
-
-    def gv(row, name):
-        j = hm.get(norm(name))
-        return row[j] if j is not None and j < len(row) else ""
-
+    gv = lambda row, name: (row[hm.get(norm(name))] if hm.get(norm(name)) is not None and hm.get(norm(name)) < len(row) else "")
     for r in data:
         if idx_slot is not None and idx_slot < len(r) and r[idx_slot] == slot_id:
-            return {
-                "doctor_full_name": gv(r, "doctor_name"),
-                "date": gv(r, "date"),
-                "time": gv(r, "time"),
-            }
+            return {"doctor_full_name": gv(r,"doctor_name"), "date": gv(r,"date"), "time": gv(r,"time")}
     return {"doctor_full_name": "", "date": "", "time": ""}
 
 def append_request(fio: str, phone: str, doctor: str, date: str, time_: str):
     ws = open_ws(REQUESTS_SHEET)
     header, _ = read_all(ws)
-    if not header:
-        ws.append_row(HEADERS[REQUESTS_SHEET])
+    if not header: ws.append_row(HEADERS[REQUESTS_SHEET])
     now_id = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws.append_row([now_id, fio, phone, doctor, date, time_, f"{date}T{time_}:00", "Новая"])
 
-# --------- Prices/Prep/Info helpers ----------
+# --------- Prices/Prep/Info/Doctors helpers ----------
 def _get_ws_records(sheet_name: str):
-    ws = open_ws(sheet_name)
-    rows = ws.get_all_records()  # list[dict] по шапке
-    return rows
+    return open_ws(sheet_name).get_all_records()
 
 def prices_search_q(q: str, limit: int = 10):
     rows = _get_ws_records(PRICES_SHEET)
@@ -254,24 +216,19 @@ def prices_search_q(q: str, limit: int = 10):
     is_code = bool(re.search(r"\d+-\d+-\d+|^srv-\d{3}$", ql))
     out = []
     for r in rows:
-        name = str(r.get("name",""))
-        code = str(r.get("code",""))
+        name = str(r.get("name","")); code = str(r.get("code",""))
         if (is_code and code.lower() == ql) or (not is_code and ql in name.lower()):
             out.append(r)
-        if len(out) >= limit:
-            break
+        if len(out) >= limit: break
     return out
 
 def prep_search_q(q: str, limit: int = 5):
     rows = _get_ws_records(PREP_SHEET)
-    ql = q.strip().lower()
-    out = []
+    ql = q.strip().lower(); out = []
     for r in rows:
         name = str(r.get("test_name",""))
-        if ql in name.lower():
-            out.append(r)
-        if len(out) >= limit:
-            break
+        if ql in name.lower(): out.append(r)
+        if len(out) >= limit: break
     return out
 
 def info_get(key: str, default: str = "") -> str:
@@ -281,16 +238,45 @@ def info_get(key: str, default: str = "") -> str:
             return str(r.get("value","")).strip()
     return default
 
+def doctors_search(q: str, limit: int = 5):
+    rows = _get_ws_records(DOCTORS_SHEET)
+    ql = q.strip().lower(); out = []
+    for r in rows:
+        fio  = str(r.get("ФИО","")); spec = str(r.get("Специальность",""))
+        if ql in fio.lower() or ql in spec.lower(): out.append(r)
+        if len(out) >= limit: break
+    return out
+
+def format_doctor_cards(items):
+    msgs = []
+    for r in items:
+        msgs.append(
+            "👨‍⚕️ *{fio}*\n"
+            "Специальность: {spec}\n"
+            "Стаж: {exp}\n"
+            "Кабинет: {cab}\n"
+            "График: {sched}\n"
+            "Сертификаты: {cert}\n"
+            "Кратко: {bio}".format(
+                fio=r.get("ФИО","").strip(),
+                spec=r.get("Специальность","").strip(),
+                exp=r.get("Стаж","").strip(),
+                cab=r.get("Кабинет","").strip(),
+                sched=r.get("График приёма","").strip(),
+                cert=r.get("Сертификаты","").strip(),
+                bio=r.get("Краткое био","").strip(),
+            )
+        )
+    return "\n\n".join(msgs)
+
 # --------- Handlers ----------
 ASK_DOCTOR, ASK_SLOT, ASK_FIO, ASK_PHONE, ASK_DATE = range(5)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    await msg.reply_text(WELCOME, reply_markup=main_menu())
+    await update.effective_message.reply_text(WELCOME, reply_markup=main_menu())
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    await msg.reply_text("Главное меню:", reply_markup=main_menu())
+    await update.effective_message.reply_text("Главное меню:", reply_markup=main_menu())
 
 async def init_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     created = ensure_headers()
@@ -323,8 +309,7 @@ async def debug_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # FSM: запись
 async def record_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    await msg.reply_text("Введите врача или специализацию (например, Гинеколог):")
+    await update.effective_message.reply_text("Введите врача или специализацию (например, Гинеколог):")
     context.user_data.clear()
     return ASK_DOCTOR
 
@@ -372,8 +357,7 @@ async def record_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_DATE
 
     if data.startswith("SLOT::"):
-        slot_id = data.split("::", 1)[1]
-        context.user_data["slot_id"] = slot_id
+        context.user_data["slot_id"] = data.split("::", 1)[1]
         await q.message.reply_text("Введите ФИО пациента:")
         return ASK_FIO
 
@@ -440,27 +424,20 @@ async def record_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# Меню-клики (цены, подготовка, контакты)
+# Меню-клики
 async def menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
-
     if data == "PRICES":
-        await q.message.reply_text("🧾 Напишите название услуги/анализа или код (например, SRV-003, 11-10-001):")
-        return
+        await q.message.reply_text("🧾 Напишите название услуги/анализа или код (например, SRV-003, 11-10-001):"); return
     if data == "PREP":
-        await q.message.reply_text("ℹ️ Напишите название анализа/исследования — пришлю памятку по подготовке.")
-        return
+        await q.message.reply_text("ℹ️ Напишите название анализа/исследования — пришлю памятку по подготовке."); return
     if data == "CONTACTS":
         hours = info_get("clinic_hours", "пн–пт 08:00–20:00, сб–вс 09:00–18:00")
         addr  = info_get("clinic_address", "Адрес уточняется")
         phone = info_get("clinic_phone", "+7 (000) 000-00-00")
-        await q.message.reply_text(
-            f"📍 РГ Клиник\nАдрес: {addr}\nТел.: {phone}\nРежим работы: {hours}",
-            reply_markup=main_menu()
-        )
-        return
+        await q.message.reply_text(f"📍 РГ Клиник\nАдрес: {addr}\nТел.: {phone}\nРежим работы: {hours}", reply_markup=main_menu()); return
 
 # FAQ команды
 async def hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -470,106 +447,74 @@ async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👤 Руководитель: {info_get('clinic_manager', 'Информация уточняется')}")
 
 async def promos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = info_get("clinic_promos", "Сейчас активных акций нет.")
-    await update.message.reply_text(f"🎉 Акции:\n{text}")
+    await update.message.reply_text(f"🎉 Акции:\n{info_get('clinic_promos', 'Сейчас активных акций нет.')}")
 
 async def services(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = info_get("clinic_services", "Перечень услуг смотрите в листе Prices.")
-    await update.message.reply_text(f"🩺 Услуги клиники:\n{text}")
+    await update.message.reply_text(f"🩺 Услуги клиники:\n{info_get('clinic_services', 'Перечень услуг смотрите в листе Prices.')}")
 
 async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    hours_v = info_get("clinic_hours", "пн–пт 08:00–20:00, сб–вс 09:00–18:00")
-    addr  = info_get("clinic_address", "Адрес уточняется")
-    phone = info_get("clinic_phone", "+7 (000) 000-00-00")
-    await update.message.reply_text(f"📍 РГ Клиник\nАдрес: {addr}\nТел.: {phone}\nРежим работы: {hours_v}")
+    h = info_get("clinic_hours", "пн–пт 08:00–20:00, сб–вс 09:00–18:00")
+    a = info_get("clinic_address", "Адрес уточняется")
+    p = info_get("clinic_phone", "+7 (000) 000-00-00")
+    await update.message.reply_text(f"📍 РГ Клиник\nАдрес: {a}\nТел.: {p}\nРежим работы: {h}")
 
-# Доктора из листа Doctors
+# Доктора
 async def doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args).strip()
     if not query:
-        await update.message.reply_text("Введите: /doctor <фамилия|специализация>")
-        return
-    rows = _get_ws_records(DOCTORS_SHEET)
-    q = query.lower()
-    found = []
-    for r in rows:
-        fio = str(r.get("ФИО",""))
-        spec = str(r.get("Специальность",""))
-        if q in fio.lower() or q in spec.lower():
-            found.append(r)
-        if len(found) >= 5:
-            break
-    if not found:
-        await update.message.reply_text("Ничего не нашлось. Попробуйте точнее (например, «Смирнова»).")
-        return
-    msgs = []
-    for r in found:
-        msgs.append(
-            "👨‍⚕️ *{fio}*\n"
-            "Специальность: {spec}\n"
-            "Стаж: {exp}\n"
-            "Кабинет: {cab}\n"
-            "График: {sched}\n"
-            "Сертификаты: {cert}\n"
-            "Кратко: {bio}".format(
-                fio=r.get("ФИО","").strip(),
-                spec=r.get("Специальность","").strip(),
-                exp=r.get("Стаж","").strip(),
-                cab=r.get("Кабинет","").strip(),
-                sched=r.get("График приёма","").strip(),
-                cert=r.get("Сертификаты","").strip(),
-                bio=r.get("Краткое био","").strip(),
-            )
-        )
-    await update.message.reply_text("\n\n".join(msgs), parse_mode="Markdown")
+        await update.message.reply_text("Введите: /doctor <фамилия|специализация>"); return
+    items = doctors_search(query, limit=5)
+    if not items:
+        await update.message.reply_text("Ничего не нашлось. Попробуйте точнее (например, «Смирнова»)."); return
+    await update.message.reply_text(format_doctor_cards(items), parse_mode="Markdown")
 
-# Универсальный FAQ-роутер (обрабатывает свободный текст)
+# Универсальный FAQ-роутер
 async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    if not text:
-        return
+    if not text: return
     tl = text.lower()
 
-    # быстрые фразы
-    if any(k in tl for k in ["график работы","режим работы","часы работы","когда открыты"]):
-        return await hours(update, context)
-    if any(k in tl for k in ["руководител", "директор", "главврач", "управляющ"]):
-        return await manager(update, context)
-    if any(k in tl for k in ["акци", "скидк", "предложени"]):
-        return await promos(update, context)
-    if any(k in tl for k in ["контакт", "адрес", "телефон"]):
-        return await contacts(update, context)
-    if any(k in tl for k in ["услуг", "направлени", "что лечите", "что делаете"]):
-        return await services(update, context)
+    # Естественный запрос про врача: «доктор/врач …» или одиночная фамилия
+    import re as _re
+    m = _re.search(r"(?:доктор|врач)\s+([A-Za-zА-Яа-яЁё\-]+)", text)
+    q_doctor = m.group(1) if m else None
+    if not q_doctor and _re.fullmatch(r"[А-Яа-яЁё\-]{4,}", text):
+        q_doctor = text
+    if q_doctor:
+        items = doctors_search(q_doctor, limit=5) or doctors_search(text, limit=5)
+        if items:
+            return await update.message.reply_text(format_doctor_cards(items), parse_mode="Markdown", reply_markup=main_menu())
 
-    # сначала памятки
+    # быстрые фразы
+    if any(k in tl for k in ["график работы","режим работы","часы работы","когда открыты"]): return await hours(update, context)
+    if any(k in tl for k in ["руководител","директор","главврач","управляющ"]): return await manager(update, context)
+    if any(k in tl for k in ["акци","скидк","предложени"]): return await promos(update, context)
+    if any(k in tl for k in ["контакт","адрес","телефон"]): return await contacts(update, context)
+    if any(k in tl for k in ["услуг","направлени","что лечите","что делаете"]): return await services(update, context)
+
+    # памятки → прайс
     prep_hits = prep_search_q(text, limit=3)
     if prep_hits:
         lines = [f"• *{h.get('test_name','')}*\n{h.get('memo','')}" for h in prep_hits]
         return await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown", reply_markup=main_menu())
-
-    # потом прайс
     price_hits = prices_search_q(text, limit=5)
     if price_hits:
         lines = []
         for h in price_hits:
             line = f"• *{h.get('name','')}*"
-            code  = h.get("code",""); price = h.get("price",""); tat = h.get("tat_days",""); notes = h.get("notes","")
-            if code:  line += f" (`{code}`)"
+            code=h.get("code",""); price=h.get("price",""); tat=h.get("tat_days",""); notes=h.get("notes","")
+            if code: line += f" (`{code}`)"
             if price: line += f" — {price}"
-            if tat:   line += f", срок: {tat}"
+            if tat: line += f", срок: {tat}"
             if notes: line += f"\n  _{notes}_"
             lines.append(line)
         return await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_menu())
 
-    # иначе — меню
     await update.message.reply_text("Я вас понял. Выберите раздел ниже 👇", reply_markup=main_menu())
 
 # --------- App wiring / startup ----------
 _last_conflict = 0
-
 async def on_startup(app):
-    # Снять вебхук и очистить очередь апдейтов перед polling
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
         logging.info("Webhook снят, очередь очищена")
@@ -579,7 +524,6 @@ async def on_startup(app):
 def build_app():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
 
-    # FSM записи
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(lambda u, c: record_start(u, c), pattern="RECORD"),
@@ -618,25 +562,21 @@ def build_app():
     # FSM
     app.add_handler(conv)
 
-    # Универсальный FAQ-роутер (в самом конце)
+    # Универсальный FAQ-роутер
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, faq_router), group=2)
 
-    # Глобальный обработчик ошибок с антиспамом по Conflict
+    # Глобальный обработчик ошибок
     async def error_handler(update, context):
         global _last_conflict
         err = context.error
         if isinstance(err, Conflict):
             now = time.time()
-            if now - _last_conflict < 60:  # не чаще 1/мин
-                return
+            if now - _last_conflict < 60: return
             _last_conflict = now
         logging.exception("Unhandled exception", exc_info=err)
         if ADMIN_CHAT_ID:
             try:
-                await context.bot.send_message(
-                    chat_id=int(ADMIN_CHAT_ID),
-                    text=f"⚠️ Ошибка: {err}"
-                )
+                await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=f"⚠️ Ошибка: {err}")
             except Exception:
                 pass
 
@@ -644,12 +584,9 @@ def build_app():
     return app
 
 def main():
-    if not BOT_TOKEN:
-        raise SystemExit("❗ TELEGRAM_BOT_TOKEN не задан")
-    if not SPREADSHEET_ID:
-        raise SystemExit("❗ GOOGLE_SPREADSHEET_ID не задан")
-    if not SERVICE_JSON:
-        raise SystemExit("❗ GOOGLE_SERVICE_ACCOUNT не задан")
+    if not BOT_TOKEN:       raise SystemExit("❗ TELEGRAM_BOT_TOKEN не задан")
+    if not SPREADSHEET_ID:  raise SystemExit("❗ GOOGLE_SPREADSHEET_ID не задан")
+    if not SERVICE_JSON:    raise SystemExit("❗ GOOGLE_SERVICE_ACCOUNT не задан")
     app = build_app()
     logging.info("Бот запускается (polling)…")
     app.run_polling(drop_pending_updates=True, close_loop=False)
