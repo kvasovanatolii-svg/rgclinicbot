@@ -1,4 +1,4 @@
-# bot.py — МедНавигатор РГ Клиник (Full v5)
+# bot.py — МедНавигатор РГ Клиник (Full v6)
 # --------------------------------------------------------------
 # ✔ Запись на приём (FREE → BOOKED), пагинация, фильтр по дате
 # ✔ Автошапки листов: /init_sheets и /fix_headers
@@ -6,6 +6,7 @@
 # ✔ Инфо-справка 24/7 из листа Info
 # ✔ Поиск по Price/Prep (кнопки и свободный текст)
 # ✔ Карточки врача из листа Doctors: /doctor и естественные фразы
+# ✔ Понимает «график приёма врачей/расписание врачей», фамилии с инициалами
 # ✔ Антиконфликт polling: снятие вебхука, подавление спама ошибок
 # Требования: python-telegram-bot==20.8, gspread, google-auth, python-dateutil
 
@@ -240,10 +241,12 @@ def info_get(key: str, default: str = "") -> str:
 
 def doctors_search(q: str, limit: int = 5):
     rows = _get_ws_records(DOCTORS_SHEET)
-    ql = q.strip().lower(); out = []
+    ql = q.strip().lower().replace(".", "")  # убираем точки из инициалов
+    out = []
     for r in rows:
         fio  = str(r.get("ФИО","")); spec = str(r.get("Специальность",""))
-        if ql in fio.lower() or ql in spec.lower(): out.append(r)
+        if ql in fio.lower().replace(".", "") or ql in spec.lower():
+            out.append(r)
         if len(out) >= limit: break
     return out
 
@@ -474,25 +477,40 @@ async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text: return
     tl = text.lower()
 
-    # Естественный запрос про врача: «доктор/врач …» или одиночная фамилия
+    # Общие запросы про график/расписание врачей
+    if any(k in tl for k in ["график врач", "расписание врач", "прием врач", "приёма врач"]):
+        docs = _get_ws_records(DOCTORS_SHEET)
+        if not docs:
+            await update.message.reply_text("Расписание врачей пока не добавлено.")
+            return
+        lines = []
+        for d in docs:
+            fio = d.get("ФИО",""); spec = d.get("Специальность","")
+            sched = d.get("График приёма",""); cab = d.get("Кабинет","")
+            lines.append(f"👨‍⚕️ *{fio}* — {spec}\n📅 {sched}\n🏥 {cab}")
+        await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown", reply_markup=main_menu())
+        return
+
+    # Естественный запрос про врача: «доктор/врач …» или одиночная фамилия (с инициалами)
     import re as _re
-    m = _re.search(r"(?:доктор|врач)\s+([A-Za-zА-Яа-яЁё\-]+)", text)
+    m = _re.search(r"(?:доктор|врач)\s+([A-Za-zА-Яа-яЁё\.\-]+)", text)
     q_doctor = m.group(1) if m else None
-    if not q_doctor and _re.fullmatch(r"[А-Яа-яЁё\-]{4,}", text):
+    if not q_doctor and _re.fullmatch(r"[А-Яа-яЁё\.\-]{4,}", text):
         q_doctor = text
     if q_doctor:
+        q_doctor = q_doctor.replace(".", "").strip()
         items = doctors_search(q_doctor, limit=5) or doctors_search(text, limit=5)
         if items:
             return await update.message.reply_text(format_doctor_cards(items), parse_mode="Markdown", reply_markup=main_menu())
 
-    # быстрые фразы
+    # Быстрые справки
     if any(k in tl for k in ["график работы","режим работы","часы работы","когда открыты"]): return await hours(update, context)
     if any(k in tl for k in ["руководител","директор","главврач","управляющ"]): return await manager(update, context)
     if any(k in tl for k in ["акци","скидк","предложени"]): return await promos(update, context)
     if any(k in tl for k in ["контакт","адрес","телефон"]): return await contacts(update, context)
     if any(k in tl for k in ["услуг","направлени","что лечите","что делаете"]): return await services(update, context)
 
-    # памятки → прайс
+    # Памятки → Прайс
     prep_hits = prep_search_q(text, limit=3)
     if prep_hits:
         lines = [f"• *{h.get('test_name','')}*\n{h.get('memo','')}" for h in prep_hits]
