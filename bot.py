@@ -609,5 +609,9 @@ def main():
     logging.info("Бот запускается (polling)…")
     app.run_polling(drop_pending_updates=True, close_loop=False)
 
+    from bot_voice import register_voice_handler
+    register_voice_handler(app)
+
 if __name__ == "__main__":
     main()
+
