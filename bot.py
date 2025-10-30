@@ -118,8 +118,9 @@ def info_get(key: str, default: str = "") -> str:
 # ---------------------------------------------------------------------
 async def stt_yandex_ogg(ogg_bytes: bytes) -> str:
     if not (YANDEX_API_KEY and YANDEX_FOLDER_ID):
-        log.warning("SpeechKit env not set")
+        log.warning("SpeechKit env missing")
         return ""
+
     params = {
         "folderId": YANDEX_FOLDER_ID,
         "lang": "ru-RU",
@@ -127,6 +128,7 @@ async def stt_yandex_ogg(ogg_bytes: bytes) -> str:
         "profanityFilter": "false",
     }
     headers = {"Authorization": f"Api-Key {YANDEX_API_KEY}"}
+
     try:
         r = requests.post(
             URL_STT,
@@ -135,14 +137,23 @@ async def stt_yandex_ogg(ogg_bytes: bytes) -> str:
             data=ogg_bytes,
             timeout=60,
         )
+        # ЛОГИРУЕМ ВСЁ, что пришло
+        log.info("STT status=%s, text=%r", r.status_code, r.text)
         r.raise_for_status()
+
+        # Ответ у STT — это text/plain вида:
+        # result=текст
+        # session_id=...
+        # если там ошибка — она тоже будет текстом
         for line in r.text.splitlines():
             if line.startswith("result="):
                 return line.split("=", 1)[1].strip()
+        # если дошли сюда — значит SpeechKit не распознал
         return ""
     except Exception as e:
         log.exception("STT error: %s", e)
         return ""
+
 
 
 async def tts_yandex_ogg(text: str) -> bytes:
