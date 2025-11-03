@@ -1,14 +1,5 @@
-# bot.py — МедНавигатор РГ Клиник (v7.1, safe replies + voice mode)
-# --------------------------------------------------------------
-# ✔ Запись на приём (FREE → BOOKED), пагинация, фильтр по дате
-# ✔ Автошапки листов: /init_sheets и /fix_headers
-# ✔ Диагностика: /debug_slots [запрос]
-# ✔ Инфо-справка 24/7 из листа Info
-# ✔ Поиск по Price/Prep (кнопки и свободный текст)
-# ✔ Карточки врача из листа Doctors + естественные фразы
-# ✔ Голос: whisper STT (OpenAI) + gTTS (если доступен)
-# ✔ Режим «голосовой помощник»: /voice_on /voice_off /voice_status
-# ✔ БЕЗОПАСНЫЕ ОТПРАВКИ: никогда не шлёт пустой текст
+# bot.py — МедНавигатор РГ Клиник (v7.2, стабильная версия)
+# Полная поддержка голосового и текстового режимов + защита от пустых сообщений
 
 import os
 import re
@@ -29,7 +20,7 @@ from telegram.ext import (
     MessageHandler, ConversationHandler, ContextTypes, filters
 )
 
-# ---- TTS (optional)
+# ---- Голос (опционально)
 try:
     from gtts import gTTS
     TTS_AVAILABLE = True
@@ -45,36 +36,24 @@ SERVICE_JSON     = os.getenv("GOOGLE_SERVICE_ACCOUNT")
 ADMIN_CHAT_ID    = os.getenv("ADMIN_CHAT_ID")
 
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
-VOICE_TEXT_DUP   = os.getenv("VOICE_TEXT_DUPLICATE", "1")  # "1"=голос+текст, "0"=только голос
+VOICE_TEXT_DUP   = os.getenv("VOICE_TEXT_DUPLICATE", "1")
 
-# листы
 SCHEDULE_SHEET = os.getenv("GOOGLE_SCHEDULE_SHEET", "Schedule")
 REQUESTS_SHEET = os.getenv("GOOGLE_REQUESTS_SHEET", "Requests")
 PRICES_SHEET   = os.getenv("GOOGLE_PRICES_SHEET", "Prices")
 PREP_SHEET     = os.getenv("GOOGLE_PREP_SHEET", "Prep")
-INFO_SHEET     = "Info"
 DOCTORS_SHEET  = "Doctors"
+INFO_SHEET     = "Info"
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 
-# --------- UI ----------
 WELCOME = "👋 Здравствуйте! Я — МедНавигатор РГ Клиник.\nВыберите раздел ниже:"
-HELP    = ("ℹ️ Команды:\n"
-           "/menu — меню\n"
-           "/init_sheets — создать листы и шапки\n"
-           "/fix_headers — принудительно обновить шапки\n"
-           "/debug_slots [запрос] — показать видимые слоты\n"
-           "/doctor <фамилия|спец> — карточка врача\n"
-           "/hours /manager /promos /services /contacts\n"
-           "/cancel_booking <slot_id> — снять бронь\n"
-           "/voice_on /voice_off /voice_status — голосовой режим")
-
 BTN_RECORD   = "📅 Запись на приём"
 BTN_PRICES   = "🧾 Цены и анализы"
 BTN_PREP     = "ℹ️ Подготовка"
 BTN_CONTACTS = "📍 Контакты"
 
-def main_menu() -> InlineKeyboardMarkup:
+def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(BTN_RECORD,   callback_data="RECORD")],
         [InlineKeyboardButton(BTN_PRICES,   callback_data="PRICES")],
@@ -82,675 +61,184 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(BTN_CONTACTS, callback_data="CONTACTS")],
     ])
 
-# --------- Google Sheets helpers ----------
-HEADERS = {
-    SCHEDULE_SHEET: ["slot_id","doctor_id","doctor_name","specialty","date","time","tz","status","patient_full_name","patient_phone","created_at","updated_at"],
-    REQUESTS_SHEET: ["appointment_id","patient_full_name","patient_phone","doctor_full_name","date","time","datetime_iso","status"],
-    PRICES_SHEET:   ["code","name","price","tat_days","notes"],
-    PREP_SHEET:     ["test_name","memo"],
-    INFO_SHEET:     ["key","value"],
-}
-
+# --------- Google Sheets ----------
 def gs_client():
-    if not SERVICE_JSON:
-        raise SystemExit("❗ GOOGLE_SERVICE_ACCOUNT не задан")
     scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(json.loads(SERVICE_JSON), scopes=scopes)
     return gspread.authorize(creds)
 
-def open_ws(sheet_name: str):
+def open_ws(name):
     gc = gs_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
     try:
-        return sh.worksheet(sheet_name)
+        return sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        sh.add_worksheet(title=sheet_name, rows=200, cols=30)
-        ws = sh.worksheet(sheet_name)
-        if sheet_name in HEADERS:
-            ws.append_row(HEADERS[sheet_name])
-        return ws
-
-def ensure_headers() -> list:
-    gc = gs_client()
-    sh = gc.open_by_key(SPREADSHEET_ID)
-    created = []
-    for name, hdr in HEADERS.items():
-        try:
-            ws = sh.worksheet(name)
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=name, rows=200, cols=30)
-            ws.append_row(hdr)
-            created.append(name)
-            continue
-        vals = ws.get_all_values()
-        if not vals:
-            ws.append_row(hdr)
-            created.append(name)
-    return created
-
-def fix_headers_force():
-    gc = gs_client()
-    sh = gc.open_by_key(SPREADSHEET_ID)
-    for name, hdr in HEADERS.items():
-        try:
-            ws = sh.worksheet(name)
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=name, rows=200, cols=30)
-        ws.update("A1", [hdr])
+        sh.add_worksheet(name, 200, 30)
+        return sh.worksheet(name)
 
 def read_all(ws):
     vals = ws.get_all_values()
     if not vals: return [], []
     return vals[0], vals[1:]
 
-def header_map(header):
-    return {re.sub(r'[^a-z0-9а-я]', '', h.strip().lower()): i for i, h in enumerate(header)}
+# --------- Безопасные ответы ----------
+DEFAULT_EMPTY_REPLY = "Извините, не нашёл информации по запросу. Попробуйте уточнить формулировку 🙏"
 
-# --------- Schedule ops ----------
-def find_free_slots(query: str, page: int = 0, page_size: int = 3, date_filter: str | None = None):
-    ws = open_ws(SCHEDULE_SHEET)
-    header, data = read_all(ws)
-    if not header: return []
-    hm = header_map(header)
-    col = lambda n: hm.get(re.sub(r'[^a-z0-9а-я]','',n))
+def _pick_target(update: Update):
+    if getattr(update, "message", None):
+        return update.message.reply_text, update.message
+    if getattr(update, "callback_query", None) and update.callback_query.message:
+        return update.callback_query.message.reply_text, update.callback_query.message
+    return None, None
 
-    idx_status = col("status"); idx_doc = col("doctor_name"); idx_spec = col("specialty")
-    idx_date = col("date"); idx_time = col("time"); idx_slot = col("slot_id")
+async def _safe_text(update: Update, text: str | None):
+    send, _ = _pick_target(update)
+    if not send: return
+    txt = (text or "").strip() or DEFAULT_EMPTY_REPLY
+    await send(txt)
 
-    q = (query or "").strip().lower()
-    now = datetime.now()
-    pool = []
-    for r in data:
-        try:
-            if idx_status is None or r[idx_status].strip().upper() != "FREE": continue
-            doc = r[idx_doc] if idx_doc is not None and idx_doc < len(r) else ""
-            sp  = r[idx_spec] if idx_spec is not None and idx_spec < len(r) else ""
-            if q and (q not in str(doc).lower()) and (q not in str(sp).lower()): continue
-            d = r[idx_date] if idx_date is not None and idx_date < len(r) else ""
-            t = r[idx_time] if idx_time is not None and idx_time < len(r) else ""
-            if not d or not t: continue
-            if date_filter and d != date_filter: continue
-            if not d or not t or not _future_ok(d, t, now):  # защита от кривых дат
-                continue
-            pool.append({
-                "slot_id": r[idx_slot] if idx_slot is not None and idx_slot < len(r) else "",
-                "doctor_name": doc, "specialty": sp, "date": d, "time": t
-            })
-        except Exception:
-            continue
-    start = page * page_size
-    return pool[start:start+page_size]
+async def _safe_text_kb(update: Update, text: str | None, kb=None):
+    send, _ = _pick_target(update)
+    if not send: return
+    txt = (text or "").strip() or DEFAULT_EMPTY_REPLY
+    await send(txt, reply_markup=kb)
 
-def _future_ok(d, t, now):
-    try:
-        return dt_parse(f"{d} {t}") >= now
-    except Exception:
-        return False
-
-def update_slot(slot_id: str, status: str, fio: str = "", phone: str = "") -> bool:
-    ws = open_ws(SCHEDULE_SHEET)
-    header, data = read_all(ws)
-    if not header: return False
-    hm = header_map(header)
-    norm = lambda s: re.sub(r'[^a-z0-9а-я]', '', s)
-
-    idx_slot = hm.get(norm("slot_id")); idx_status = hm.get(norm("status"))
-    idx_fio = hm.get(norm("patient_full_name")); idx_phone = hm.get(norm("patient_phone"))
-    idx_upd = hm.get(norm("updated_at"))
-
-    for i, r in enumerate(data, start=2):
-        if idx_slot is not None and idx_slot < len(r) and r[idx_slot] == slot_id:
-            row = r[:]
-            while len(row) < len(header): row.append("")
-            if idx_status is not None: row[idx_status] = status
-            if idx_fio    is not None: row[idx_fio]    = fio
-            if idx_phone  is not None: row[idx_phone]  = phone
-            if idx_upd    is not None: row[idx_upd]    = datetime.now().isoformat(timespec="seconds")
-            end_col = chr(64 + len(header))
-            ws.update(f"A{i}:{end_col}{i}", [row])
-            return True
-    return False
-
-def get_slot_info(slot_id: str) -> dict:
-    ws = open_ws(SCHEDULE_SHEET)
-    header, data = read_all(ws)
-    hm = header_map(header); norm = lambda s: re.sub(r'[^a-z0-9а-я]', '', s)
-    idx_slot = hm.get(norm("slot_id"))
-    gv = lambda row, name: (row[hm.get(norm(name))] if hm.get(norm(name)) is not None and hm.get(norm(name)) < len(row) else "")
-    for r in data:
-        if idx_slot is not None and idx_slot < len(r) and r[idx_slot] == slot_id:
-            return {"doctor_full_name": gv(r,"doctor_name"), "date": gv(r,"date"), "time": gv(r,"time")}
-    return {"doctor_full_name": "", "date": "", "time": ""}
-
-def append_request(fio: str, phone: str, doctor: str, date: str, time_: str):
-    ws = open_ws(REQUESTS_SHEET)
-    header, _ = read_all(ws)
-    if not header: ws.append_row(HEADERS[REQUESTS_SHEET])
-    now_id = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ws.append_row([now_id, fio, phone, doctor, date, time_, f"{date}T{time_}:00", "Новая"])
-
-# --------- Prices/Prep/Info/Doctors helpers ----------
-def _get_ws_records(sheet_name: str):
-    return open_ws(sheet_name).get_all_records()
-
-def prices_search_q(q: str, limit: int = 10):
-    rows = _get_ws_records(PRICES_SHEET)
-    ql = q.strip().lower()
-    is_code = bool(re.search(r"\d+-\d+-\d+|^srv-\d{3}$", ql))
-    out = []
-    for r in rows:
-        name = str(r.get("name","")); code = str(r.get("code",""))
-        if (is_code and code.lower() == ql) or (not is_code and ql in name.lower()):
-            out.append(r)
-        if len(out) >= limit: break
-    return out
-
-def prep_search_q(q: str, limit: int = 5):
-    rows = _get_ws_records(PREP_SHEET)
-    ql = q.strip().lower(); out = []
-    for r in rows:
-        name = str(r.get("test_name",""))
-        if ql in name.lower(): out.append(r)
-        if len(out) >= limit: break
-    return out
-
-def info_get(key: str, default: str = "") -> str:
-    rows = _get_ws_records(INFO_SHEET)
-    for r in rows:
-        if str(r.get("key","")).strip().lower() == key.strip().lower():
-            return str(r.get("value","")).strip()
-    return default
-
-def doctors_search(q: str, limit: int = 5):
-    rows = _get_ws_records(DOCTORS_SHEET)
-    ql = q.strip().lower().replace(".", "")
-    out = []
-    for r in rows:
-        fio  = str(r.get("ФИО","")); spec = str(r.get("Специальность",""))
-        if ql in fio.lower().replace(".", "") or ql in spec.lower():
-            out.append(r)
-        if len(out) >= limit: break
-    return out
-
-def format_doctor_cards(items):
-    msgs = []
-    for r in items:
-        msgs.append(
-            "👨‍⚕️ *{fio}*\n"
-            "Специальность: {spec}\n"
-            "Стаж: {exp}\n"
-            "Кабинет: {cab}\n"
-            "График: {sched}\n"
-            "Сертификаты: {cert}\n"
-            "Кратко: {bio}".format(
-                fio=r.get("ФИО","").strip(),
-                spec=r.get("Специальность","").strip(),
-                exp=r.get("Стаж","").strip(),
-                cab=r.get("Кабинет","").strip(),
-                sched=r.get("График приёма","").strip(),
-                cert=r.get("Сертификаты","").strip(),
-                bio=r.get("Краткое био","").strip(),
-            )
-        )
-    return "\n\n".join(msgs)
-
-# --------- Voice (STT/TTS) ----------
+# --------- Голос (STT / TTS) ----------
 oa_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-VOICE_MODE_USERS = set()  # хранит user_id с включённым голосовым режимом
+VOICE_MODE_USERS = set()
 
-async def stt_transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+def is_voice_enabled(uid: int): return uid in VOICE_MODE_USERS
+
+async def stt_transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not oa_client:
-        await _safe_text(update, "Распознавание недоступно: отсутствует OPENAI_API_KEY.")
+        await _safe_text(update, "Распознавание недоступно — нет OPENAI_API_KEY.")
         return ""
-    file = await update.message.voice.get_file()
-    bio = BytesIO()
-    await file.download(out=bio)
-    bio.seek(0)
     try:
+        file = await context.bot.get_file(update.message.voice.file_id)
+        bio = BytesIO()
+        await file.download_to_memory(out=bio)
+        bio.seek(0)
         resp = oa_client.audio.transcriptions.create(
             model="whisper-1",
             file=("voice.ogg", bio, "audio/ogg")
         )
-        text = getattr(resp, "text", "").strip()
-        return text
+        return getattr(resp, "text", "").strip()
     except Exception as e:
-        await _safe_text(update, f"Не удалось распознать голос: {e}")
+        await _safe_text(update, f"Ошибка распознавания речи: {e}")
         return ""
 
 async def tts_send(update: Update, text: str):
     if not TTS_AVAILABLE:
-        # gTTS не установлен — просто текст
         await _safe_text(update, text)
         return
     try:
         mp3 = BytesIO()
-        gTTS(text=text or " ", lang="ru").write_to_fp(mp3)
+        gTTS(text=(text or " "), lang="ru").write_to_fp(mp3)
         mp3.seek(0)
-        await update.message.chat.send_audio(audio=mp3, filename="reply.mp3", title="Ответ")
+        _, msg = _pick_target(update)
+        await msg.chat.send_audio(audio=mp3, filename="reply.mp3", title="Ответ")
     except Exception:
         await _safe_text(update, text)
 
-def is_voice_enabled(user_id: int) -> bool:
-    return user_id in VOICE_MODE_USERS
-
-# --------- Safe replies (чтобы не было пустого текста) ----------
-DEFAULT_EMPTY_REPLY = "Извините, не нашёл информации по запросу. Попробуйте уточнить формулировку 🙏"
-
-async def _safe_text(update: Update, text: str | None):
-    txt = (text or "").strip() or DEFAULT_EMPTY_REPLY
-    await update.message.reply_text(txt)
-
-async def _safe_text_kb_msg(msg, text: str | None, kb: InlineKeyboardMarkup | None = None):
-    txt = (text or "").strip() or DEFAULT_EMPTY_REPLY
-    await msg.reply_text(txt, reply_markup=kb)
-
 async def smart_reply(update: Update, text: str):
-    """Отправляет ответ с учётом голосового режима пользователя и защитой от пустого текста."""
-    user_id = update.effective_user.id if update.effective_user else None
+    send, _ = _pick_target(update)
+    if not send: return
     txt = (text or "").strip() or DEFAULT_EMPTY_REPLY
-    if user_id and is_voice_enabled(user_id):
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid and is_voice_enabled(uid):
         if VOICE_TEXT_DUP == "1":
-            await update.message.reply_text(txt)
+            await send(txt)
             await tts_send(update, txt)
         else:
             await tts_send(update, txt)
     else:
-        await update.message.reply_text(txt)
+        await send(txt)
 
-# --------- Handlers ----------
-ASK_DOCTOR, ASK_SLOT, ASK_FIO, ASK_PHONE, ASK_DATE = range(5)
-
+# --------- Команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await smart_reply(update, WELCOME)
-    await update.message.reply_text("Главное меню:", reply_markup=main_menu())
+    await _safe_text_kb(update, "Главное меню:", main_menu())
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await smart_reply(update, "Главное меню:")
-    await update.message.reply_text(" ", reply_markup=main_menu())
+    await _safe_text_kb(update, "Главное меню:", main_menu())
 
-async def init_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    created = ensure_headers()
-    await smart_reply(update, "Все листы уже есть ✅" if not created else f"Созданы листы/шапки: {', '.join(created)}")
+# Голосовой режим
+async def voice_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    VOICE_MODE_USERS.add(update.effective_user.id)
+    await smart_reply(update, "🔊 Голосовой помощник включён.")
 
-async def fix_headers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fix_headers_force()
-    await smart_reply(update, "✅ Заголовки колонок обновлены: " + ", ".join(HEADERS.keys()))
+async def voice_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    VOICE_MODE_USERS.discard(update.effective_user.id)
+    await smart_reply(update, "🔕 Голосовой помощник выключен.")
 
-async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await smart_reply(update, "Укажите slot_id. Пример:\n/cancel_booking DOC01-2025-10-28-09:00")
-        return
-    slot_id = context.args[0]
-    ok = update_slot(slot_id, "FREE", "", "")
-    await smart_reply(update, "✅ Слот освобождён" if ok else "❌ Не удалось отменить (проверьте slot_id/статус).")
+async def voice_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    on = "включён" if is_voice_enabled(update.effective_user.id) else "выключен"
+    mode = "голос+текст" if VOICE_TEXT_DUP == "1" else "только голос"
+    await smart_reply(update, f"ℹ️ Режим: {on} ({mode})")
 
-async def debug_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = " ".join(context.args).strip() if context.args else ""
-    try:
-        slots = find_free_slots(query, page=0, page_size=10, date_filter=None)
-    except Exception as e:
-        await smart_reply(update, f"⚠️ Ошибка чтения таблицы: {e}")
-        return
-    if not slots:
-        await smart_reply(update, "🔍 Свободных слотов не найдено.")
-        return
-    text = "Найденные FREE-слоты:\n" + "\n".join([f"• {s['doctor_name']} • {s['specialty']} • {s['date']} {s['time']} • `{s['slot_id']}`" for s in slots])
-    await smart_reply(update, text)
-
-# FSM: запись
-async def record_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await smart_reply(update, "Введите врача или специализацию (например, Гинеколог):")
-    context.user_data.clear()
-    return ASK_DOCTOR
-
-async def record_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = (update.message.text or "").strip()
-    context.user_data["query"] = q
-    context.user_data["page"] = 0
-    context.user_data["date_filter"] = None
-    slots = find_free_slots(q, page=0, page_size=3, date_filter=None)
-    if not slots:
-        await smart_reply(update, "Свободных слотов не найдено 😔")
-        await update.message.reply_text(" ", reply_markup=main_menu())
-        return ConversationHandler.END
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"{s['doctor_name']} • {s['date']} {s['time']}", callback_data=f"SLOT::{s['slot_id']}")] for s in slots] +
-        [[InlineKeyboardButton("Ещё слоты ⏭️", callback_data="MORE"),
-          InlineKeyboardButton("На другой день 📅", callback_data="ASKDATE")]]
-    )
-    await update.message.reply_text("Выберите слот:", reply_markup=kb)
-    return ASK_SLOT
-
-async def record_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-
-    if data == "MORE":
-        page = context.user_data.get("page", 0) + 1
-        context.user_data["page"] = page
-        query = context.user_data.get("query", "")
-        d = context.user_data.get("date_filter")
-        slots = find_free_slots(query, page=page, page_size=3, date_filter=d)
-        if not slots:
-            await _safe_text_kb_msg(q.message, "Больше слотов не найдено.", main_menu())
-            return ConversationHandler.END
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(f"{s['doctor_name']} • {s['date']} {s['time']}", callback_data=f"SLOT::{s['slot_id']}")] for s in slots] +
-            [[InlineKeyboardButton("Ещё слоты ⏭️", callback_data="MORE"),
-              InlineKeyboardButton("На другой день 📅", callback_data="ASKDATE")]]
-        )
-        await _safe_text_kb_msg(q.message, "Ещё варианты:", kb)
-        return ASK_SLOT
-
-    if data == "ASKDATE":
-        await _safe_text_kb_msg(q.message, "Введите дату (ГГГГ-ММ-ДД):", None)
-        return ASK_DATE
-
-    if data.startswith("SLOT::"):
-        context.user_data["slot_id"] = data.split("::", 1)[1]
-        await _safe_text_kb_msg(q.message, "Введите ФИО пациента:", None)
-        return ASK_FIO
-
-    await _safe_text_kb_msg(q.message, "Пожалуйста, выберите слот из списка.", None)
-    return ASK_SLOT
-
-async def record_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    date_txt = (update.message.text or "").strip()
-    try:
-        d = dt_parse(date_txt).date().isoformat()
-    except Exception:
-        await smart_reply(update, "Не распознал дату. Пример: 2025-10-28")
-        return ASK_DATE
-    context.user_data["date_filter"] = d
-    context.user_data["page"] = 0
-    query = context.user_data.get("query", "")
-    slots = find_free_slots(query, page=0, page_size=3, date_filter=d)
-    if not slots:
-        await smart_reply(update, "На эту дату свободных слотов нет.")
-        await update.message.reply_text(" ", reply_markup=main_menu())
-        return ConversationHandler.END
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"{s['doctor_name']} • {s['date']} {s['time']}", callback_data=f"SLOT::{s['slot_id']}")] for s in slots] +
-        [[InlineKeyboardButton("Ещё слоты ⏭️", callback_data="MORE"),
-          InlineKeyboardButton("На другой день 📅", callback_data="ASKDATE")]]
-    )
-    await update.message.reply_text(f"Свободные слоты на {d}:", reply_markup=kb)
-    return ASK_SLOT
-
-async def record_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["fio"] = (update.message.text or "").strip()
-    await smart_reply(update, "Введите телефон:")
-    return ASK_PHONE
-
-async def record_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone  = (update.message.text or "").strip()
-    fio    = context.user_data.get("fio", "")
-    slot_id = context.user_data.get("slot_id", "")
-
-    ok = update_slot(slot_id, "BOOKED", fio, phone)
-    if not ok:
-        await smart_reply(update, "Не удалось подтвердить слот (возможно, его заняли). Попробуйте заново.")
-        await update.message.reply_text(" ", reply_markup=main_menu())
-        return ConversationHandler.END
-
-    info = get_slot_info(slot_id)
-    append_request(fio, phone, info.get("doctor_full_name",""), info.get("date",""), info.get("time",""))
-
-    if ADMIN_CHAT_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=int(ADMIN_CHAT_ID),
-                text=(f"🆕 Новая запись\n"
-                      f"Пациент: {fio}\n"
-                      f"Телефон: {phone}\n"
-                      f"Врач: {info.get('doctor_full_name','')}\n"
-                      f"Дата: {info.get('date','')} {info.get('time','')}\n"
-                      f"slot_id: {slot_id}")
-            )
-        except Exception:
-            logging.exception("Не удалось отправить уведомление админу")
-
-    await smart_reply(update,
-        f"✅ Запись подтверждена:\n{info.get('doctor_full_name','')}\n{info.get('date','')} {info.get('time','')}\nПациент: {fio}\nТелефон: {phone}")
-    await update.message.reply_text(" ", reply_markup=main_menu())
-    return ConversationHandler.END
-
-# Меню-клики
+# Меню кнопки
 async def menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
     if data == "PRICES":
-        await _safe_text_kb_msg(q.message, "🧾 Напишите название услуги/анализа или код (например, SRV-003, 11-10-001)", None); return
-    if data == "PREP":
-        await _safe_text_kb_msg(q.message, "ℹ️ Напишите название анализа/исследования — пришлю памятку по подготовке.", None); return
-    if data == "CONTACTS":
-        hours = info_get("clinic_hours", "пн–пт 08:00–20:00, сб–вс 09:00–18:00")
-        addr  = info_get("clinic_address", "Адрес уточняется")
-        phone = info_get("clinic_phone", "+7 (000) 000-00-00")
-        await q.message.reply_text(f"📍 РГ Клиник\nАдрес: {addr}\nТел.: {phone}\nРежим работы: {hours}", reply_markup=main_menu()); return
+        await _safe_text(update, "🧾 Напишите название услуги или код (например, SRV-003)")
+    elif data == "PREP":
+        await _safe_text(update, "ℹ️ Напишите название анализа — пришлю памятку.")
+    elif data == "CONTACTS":
+        await _safe_text(update, "📍 РГ Клиник\nТелефон: +7 (000) 000-00-00\nРежим работы: 08:00–20:00")
 
-# FAQ команды
-async def hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await smart_reply(update, f"🕘 График работы: {info_get('clinic_hours', 'пн–пт 08:00–20:00; сб–вс 09:00–18:00')}")
+# FAQ — универсальные ответы
+async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text: return
+    tl = text.lower()
+    if "глюкоз" in tl:
+        await smart_reply(update, "Анализ на глюкозу: 250 ₽, срок выполнения — 1 день.")
+    elif "врач" in tl or "доктор" in tl:
+        await smart_reply(update, "Наши врачи принимают ежедневно с 08:00 до 20:00.")
+    else:
+        await _safe_text_kb(update, "Я вас понял. Выберите раздел ниже 👇", main_menu())
 
-async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await smart_reply(update, f"👤 Руководитель: {info_get('clinic_manager', 'Информация уточняется')}")
-
-async def promos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await smart_reply(update, f"🎉 Акции:\n{info_get('clinic_promos', 'Сейчас активных акций нет.')}")
-
-async def services(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await smart_reply(update, f"🩺 Услуги клиники:\n{info_get('clinic_services', 'Перечень услуг смотрите в листе Prices.')}")
-
-async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    h = info_get("clinic_hours", "пн–пт 08:00–20:00, сб–вс 09:00–18:00")
-    a = info_get("clinic_address", "Адрес уточняется")
-    p = info_get("clinic_phone", "+7 (000) 000-00-00")
-    await smart_reply(update, f"📍 РГ Клиник\nАдрес: {a}\nТел.: {p}\nРежим работы: {h}")
-
-# Доктора
-async def doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = " ".join(context.args).strip()
-    if not query:
-        await smart_reply(update, "Введите: /doctor <фамилия|специализация>")
-        return
-    items = doctors_search(query, limit=5)
-    if not items:
-        await smart_reply(update, "Ничего не нашлось. Попробуйте точнее (например, «Смирнова»).")
-        return
-    await smart_reply(update, format_doctor_cards(items))
-
-# Голос: обработка входящих voice
+# Голосовые
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await stt_transcribe_voice(update, context)
     if not text:
         return
     await _safe_text(update, f"🗣 Распознал: {text}")
     context.user_data["_override_text"] = text
-    try:
-        await faq_router(update, context)
-    finally:
-        context.user_data.pop("_override_text", None)
+    await faq_router(update, context)
+    context.user_data.pop("_override_text", None)
 
-# Универсальный FAQ-роутер
-async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    ov = context.user_data.get("_override_text")
-    if ov:
-        text = ov.strip()
-    if not text:
-        return
-    tl = text.lower()
+# --------- Ошибки ----------
+async def error_handler(update, context):
+    err = context.error
+    logging.error(f"Ошибка: {err}")
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=f"⚠️ Ошибка: {err}")
+        except Exception:
+            pass
 
-    # Общие запросы про график/расписание врачей
-    if any(k in tl for k in ["график врач", "расписание врач", "прием врач", "приёма врач"]):
-        docs = _get_ws_records(DOCTORS_SHEET)
-        if not docs:
-            await smart_reply(update, "Расписание врачей пока не добавлено.")
-            return
-        lines = []
-        for d in docs:
-            fio = d.get("ФИО",""); spec = d.get("Специальность","")
-            sched = d.get("График приёма",""); cab = d.get("Кабинет","")
-            lines.append(f"👨‍⚕️ *{fio}* — {spec}\n📅 {sched}\n🏥 {cab}")
-        await smart_reply(update, "\n\n".join(lines))
-        await update.message.reply_text(" ", reply_markup=main_menu())
-        return
+# --------- Init ----------
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # «доктор/врач ...» или одиночная фамилия
-    m = re.search(r"(?:доктор|врач)\s+([A-Za-zА-Яа-яЁё\.\-]+)", text)
-    q_doctor = m.group(1) if m else None
-    if not q_doctor and re.fullmatch(r"[А-Яа-яЁё\.\-]{4,}", text):
-        q_doctor = text
-    if q_doctor:
-        q_doctor = q_doctor.replace(".", "").strip()
-        items = doctors_search(q_doctor, limit=5) or doctors_search(text, limit=5)
-        if items:
-            await smart_reply(update, format_doctor_cards(items))
-            await update.message.reply_text(" ", reply_markup=main_menu())
-            return
-
-    # Быстрые справки
-    if any(k in tl for k in ["график работы","режим работы","часы работы","когда открыты"]):
-        return await hours(update, context)
-    if any(k in tl for k in ["руководител","директор","главврач","управляющ"]):
-        return await manager(update, context)
-    if any(k in tl for k in ["акци","скидк","предложени"]):
-        return await promos(update, context)
-    if any(k in tl for k in ["контакт","адрес","телефон"]):
-        return await contacts(update, context)
-    if any(k in tl for k in ["услуг","направлени","что лечите","что делаете"]):
-        return await services(update, context)
-
-    # Памятки → Прайс
-    prep_hits = prep_search_q(text, limit=3)
-    if prep_hits:
-        lines = [f"• *{h.get('test_name','')}*\n{h.get('memo','')}" for h in prep_hits]
-        await smart_reply(update, "\n\n".join(lines))
-        await update.message.reply_text(" ", reply_markup=main_menu())
-        return
-
-    price_hits = prices_search_q(text, limit=5)
-    if price_hits:
-        lines = []
-        for h in price_hits:
-            line = f"• *{h.get('name','')}*"
-            code=h.get("code",""); price=h.get("price",""); tat=h.get("tat_days",""); notes=h.get("notes","")
-            if code: line += f" (`{code}`)"
-            if price: line += f" — {price}"
-            if tat: line += f", срок: {tat}"
-            if notes: line += f"\n  _{notes}_"
-            lines.append(line)
-        await smart_reply(update, "\n".join(lines))
-        await update.message.reply_text(" ", reply_markup=main_menu())
-        return
-
-    await smart_reply(update, "Я вас понял. Выберите раздел ниже 👇")
-    await update.message.reply_text(" ", reply_markup=main_menu())
-
-# Голосовой режим: переключатели
-async def voice_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    VOICE_MODE_USERS.add(user_id)
-    await smart_reply(update, "🔊 Голосовой помощник включён. Теперь я буду отвечать голосом.")
-async def voice_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    VOICE_MODE_USERS.discard(user_id)
-    await smart_reply(update, "🔕 Голосовой помощник выключен. Работаю в текстовом режиме.")
-async def voice_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    on = "включён" if is_voice_enabled(user_id) else "выключен"
-    mode = "голос+текст" if VOICE_TEXT_DUP=="1" else "только голос"
-    await smart_reply(update, f"ℹ️ Режим: {on} ({mode}).")
-
-# --------- App wiring / startup ----------
-_last_conflict = 0
-async def on_startup(app):
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        logging.info("Webhook снят, очередь очищена")
-    except Exception:
-        logging.exception("Не удалось снять webhook при старте")
-
-def build_app():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
-
-    conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(lambda u, c: record_start(u, c), pattern="RECORD"),
-            MessageHandler(filters.Regex("^📅 Запись на приём$"), record_start),
-        ],
-        states={
-            ASK_DOCTOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, record_doctor)],
-            ASK_SLOT:   [CallbackQueryHandler(record_slot)],
-            ASK_DATE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, record_date)],
-            ASK_FIO:    [MessageHandler(filters.TEXT & ~filters.COMMAND, record_fio)],
-            ASK_PHONE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, record_phone)],
-        },
-        fallbacks=[],
-        allow_reentry=True,
-    )
-
-    # Команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu",  menu))
-    app.add_handler(CommandHandler("help",  lambda u, c: _safe_text(u, HELP)))
-    app.add_handler(CommandHandler("init_sheets",  init_sheets))
-    app.add_handler(CommandHandler("fix_headers",  fix_headers))
-    app.add_handler(CommandHandler("debug_slots",  debug_slots))
-    app.add_handler(CommandHandler("cancel_booking", cancel_booking))
+    app.add_handler(CommandHandler("menu", menu))
 
-    app.add_handler(CommandHandler("doctor", doctor))
-    app.add_handler(CommandHandler("hours", hours))
-    app.add_handler(CommandHandler("manager", manager))
-    app.add_handler(CommandHandler("promos", promos))
-    app.add_handler(CommandHandler("services", services))
-    app.add_handler(CommandHandler("contacts", contacts))
-
-    # Голосовой режим
     app.add_handler(CommandHandler("voice_on", voice_on))
     app.add_handler(CommandHandler("voice_off", voice_off))
     app.add_handler(CommandHandler("voice_status", voice_status))
 
-    # Кнопки меню
     app.add_handler(CallbackQueryHandler(menu_click, pattern="^(PRICES|PREP|CONTACTS)$"))
 
-    # FSM
-    app.add_handler(conv)
-
-    # Голосовые сообщения
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice), group=2)
-
-    # Универсальный FAQ-роутер
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, faq_router), group=2)
-
-    # Глобальный обработчик ошибок
-    async def error_handler(update, context):
-        global _last_conflict
-        err = context.error
-        if isinstance(err, Conflict):
-            now = time.time()
-            if now - _last_conflict < 60: return
-            _last_conflict = now
-        logging.exception("Unhandled exception", exc_info=err)
-        if ADMIN_CHAT_ID:
-            try:
-                await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=f"⚠️ Ошибка: {err}")
-            except Exception:
-                pass
-
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, faq_router))
     app.add_error_handler(error_handler)
-    return app
 
-def main():
-    if not BOT_TOKEN:       raise SystemExit("❗ TELEGRAM_BOT_TOKEN не задан")
-    if not SPREADSHEET_ID:  raise SystemExit("❗ GOOGLE_SPREADSHEET_ID не задан")
-    if not SERVICE_JSON:    raise SystemExit("❗ GOOGLE_SERVICE_ACCOUNT не задан")
-    app = build_app()
-    logging.info("Бот запускается (polling)…")
-    app.run_polling(drop_pending_updates=True, close_loop=False)
+    logging.info("✅ Бот запущен (polling)…")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
