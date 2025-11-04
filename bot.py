@@ -1,6 +1,5 @@
-# bot.py — МедНавигатор РГ Клиник (v8.0, stable)
-# Полный функционал: запись, справка из Sheets, врачи, прайс, подготовка, FAQ, голосовой режим
-# Требования: python-telegram-bot==20.8, gspread, google-auth, python-dateutil, openai>=1.40.0, gTTS>=2.5.1
+# bot.py — МедНавигатор РГ Клиник (v8.1)
+# Полный функционал + озвучка всех ответов + GPT-fallback для справочной информации
 
 import os
 import re
@@ -320,6 +319,60 @@ def append_request(fio, phone, doctor, date, time_):
     now_id=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws.append_row([now_id,fio,phone,doctor,date,time_,f"{date}T{time_}:00","Новая"])
 
+# ---------- AI fallback ----------
+def _collect_context_for_ai():
+    ctx = {
+        "hours": info_get("clinic_hours", ""),
+        "address": info_get("clinic_address", ""),
+        "phone": info_get("clinic_phone", ""),
+        "services": info_get("clinic_services", ""),
+        "manager": info_get("clinic_manager", ""),
+        "promos": info_get("clinic_promos", ""),
+        "doctors": [r.get("ФИО","")+" — "+r.get("Специальность","") for r in _get_ws_records(DOCTORS_SHEET)][:20]
+    }
+    return ctx
+
+def _ai_prompt_system(ctx):
+    return (
+        "Ты — 'МедНавигатор РГ Клиник', справочный помощник клиники. "
+        "Отвечай только по организации работы клиники и её услугам. "
+        "Не давай диагнозов, не назначай лечение, не интерпретируй анализы. "
+        "Если вопрос медицинский — мягко предложи записаться к врачу. "
+        "Коротко, понятно, дружелюбно. Если ответ неочевиден — скажи, что уточним у администратора.\n\n"
+        f"Контекст (справочно):\n"
+        f"- Режим работы: {ctx.get('hours')}\n"
+        f"- Адрес: {ctx.get('address')}\n"
+        f"- Телефон: {ctx.get('phone')}\n"
+        f"- Руководитель: {ctx.get('manager')}\n"
+        f"- Услуги: {ctx.get('services')}\n"
+        f"- Акции: {ctx.get('promos')}\n"
+        f"- Врачи: {', '.join(ctx.get('doctors', []))}\n"
+        "Если информации нет — так и скажи и предложи связать с администратором."
+    )
+
+def ai_answer(question: str) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+    client = oa_client or OpenAI(api_key=OPENAI_API_KEY)
+    ctx = _collect_context_for_ai()
+    system = _ai_prompt_system(ctx)
+    try:
+        # компактная и дешёвая модель, можно заменить на gpt-4o
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": question.strip()},
+            ],
+            temperature=0.3,
+            max_tokens=400,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text
+    except Exception as e:
+        logging.exception("AI answer failed: %s", e)
+        return ""
+
 # ---------- Handlers ----------
 ASK_DOCTOR, ASK_SLOT, ASK_FIO, ASK_PHONE, ASK_DATE = range(5)
 
@@ -432,20 +485,24 @@ async def record_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Запись подтверждена:\n{info.get('doctor_full_name','')}\n{info.get('date','')} {info.get('time','')}\nПациент: {fio}\nТелефон: {phone}")
     await _safe_text_kb(update, "Главное меню:", main_menu()); return ConversationHandler.END
 
-# --- Меню-клики
+# --- Меню-клики (все ответы через smart_reply -> озвучиваются)
 async def menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer(); data=q.data
     if data=="PRICES":
-        await _safe_text(update, "🧾 Напишите название услуги/анализа или код (например, SRV-003, 11-10-001)"); return
+        await smart_reply(update, "🧾 Напишите название услуги/анализа или код (например, SRV-003, 11-10-001)")
+        return
     if data=="PREP":
-        await _safe_text(update, "ℹ️ Напишите название анализа/исследования — пришлю памятку по подготовке."); return
+        await smart_reply(update, "ℹ️ Напишите название анализа/исследования — пришлю памятку по подготовке.")
+        return
     if data=="CONTACTS":
         hours=info_get("clinic_hours","пн–пт 08:00–20:00, сб–вс 09:00–18:00")
         addr=info_get("clinic_address","Адрес уточняется")
         phone=info_get("clinic_phone","+7 (000) 000-00-00")
-        await _safe_text_kb(update, f"📍 РГ Клиник\nАдрес: {addr}\nТел.: {phone}\nРежим работы: {hours}", main_menu()); return
+        await smart_reply(update, f"📍 РГ Клиник\nАдрес: {addr}\nТел.: {phone}\nРежим работы: {hours}")
+        await _safe_text_kb(update, "Главное меню:", main_menu())
+        return
 
-# --- FAQ router (естественные запросы)
+# --- FAQ router (правила + GPT fallback)
 async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text=(update.message.text or "").strip()
     if not text: return
@@ -472,7 +529,7 @@ async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await smart_reply(update, format_doctor_cards(items))
             await _safe_text_kb(update, "Выберите раздел ниже 👇", main_menu()); return
 
-    # Быстрые справки
+    # Быстрые справки из Info
     if any(k in tl for k in ["график работы","режим работы","часы работы","когда открыты"]):
         await smart_reply(update, f"🕘 График работы: {info_get('clinic_hours','пн–пт 08:00–20:00; сб–вс 09:00–18:00')}"); return
     if any(k in tl for k in ["руководител","директор","главврач","управляющ"]):
@@ -497,21 +554,29 @@ async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines=[]
         for h in price_hits:
             line=f"• *{h.get('name','')}*"
-            if h.get("code"):   line += f" (`{h.get('code')}`)"
-            if h.get("price"):  line += f" — {h.get('price')}"
+            if h.get("code"):     line += f" (`{h.get('code')}`)"
+            if h.get("price"):    line += f" — {h.get('price')}"
             if h.get("tat_days"): line += f", срок: {h.get('tat_days')}"
-            if h.get("notes"):  line += f"\n  _{h.get('notes')}_"
+            if h.get("notes"):    line += f"\n  _{h.get('notes')}_"
             lines.append(line)
         await smart_reply(update, "\n".join(lines))
         await _safe_text_kb(update, "Выберите раздел ниже 👇", main_menu()); return
 
+    # ---- GPT fallback (справочно) ----
+    ai = ai_answer(text)
+    if ai:
+        await smart_reply(update, ai)
+        await _safe_text_kb(update, "Нужна запись или другая справка? Выберите ниже 👇", main_menu())
+        return
+
+    # если совсем ничего
     await _safe_text_kb(update, "Я вас понял. Выберите раздел ниже 👇", main_menu())
 
 # --- Голосовые сообщения
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await stt_transcribe_voice(update, context)
     if not text: return
-    await _safe_text(update, f"🗣 Распознал: {text}")
+    await smart_reply(update, f"🗣 Распознал: {text}")
     context.user_data["_override_text"]=text
     await faq_router(update, context)
     context.user_data.pop("_override_text", None)
@@ -570,7 +635,7 @@ def build_app():
     app.add_handler(CommandHandler("debug_slots", debug_slots))
     app.add_handler(CommandHandler("cancel_booking", cancel_booking))
 
-    # голосовые команды
+    # голосовой режим
     app.add_handler(CommandHandler("voice_on", voice_on))
     app.add_handler(CommandHandler("voice_off", voice_off))
     app.add_handler(CommandHandler("voice_status", voice_status))
