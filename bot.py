@@ -1,11 +1,9 @@
-# bot.py — МедНавигатор РГ Клиник (v8.1)
-# Полный функционал + озвучка всех ответов + GPT-fallback для справочной информации
+# bot.py — МедНавигатор РГ Клиник (v8.2)
+# + AI price formatting (из листа Prices)
+# + AI templates (/templates, /gen_template <type>)
+# Остальное — как в v8.1 (запись, голос, справка, доктора и т.п.)
 
-import os
-import re
-import json
-import time
-import logging
+import os, re, json, time, logging
 from io import BytesIO
 from datetime import datetime
 from dateutil.parser import parse as dt_parse
@@ -251,7 +249,7 @@ def format_doctor_cards(items):
         )
     return "\n\n".join(msgs)
 
-# ---------- Schedule (поиск/бронь) ----------
+# ---------- Schedule ----------
 def _future_ok(d, t, now):
     try: return dt_parse(f"{d} {t}") >= now
     except Exception: return False
@@ -319,59 +317,127 @@ def append_request(fio, phone, doctor, date, time_):
     now_id=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws.append_row([now_id,fio,phone,doctor,date,time_,f"{date}T{time_}:00","Новая"])
 
-# ---------- AI fallback ----------
+# ---------- AI helpers ----------
 def _collect_context_for_ai():
-    ctx = {
+    return {
         "hours": info_get("clinic_hours", ""),
         "address": info_get("clinic_address", ""),
         "phone": info_get("clinic_phone", ""),
         "services": info_get("clinic_services", ""),
         "manager": info_get("clinic_manager", ""),
         "promos": info_get("clinic_promos", ""),
-        "doctors": [r.get("ФИО","")+" — "+r.get("Специальность","") for r in _get_ws_records(DOCTORS_SHEET)][:20]
+        "doctors": [r.get("ФИО","")+" — "+r.get("Специальность","") for r in _get_ws_records(DOCTORS_SHEET)][:30]
     }
-    return ctx
 
-def _ai_prompt_system(ctx):
-    return (
-        "Ты — 'МедНавигатор РГ Клиник', справочный помощник клиники. "
-        "Отвечай только по организации работы клиники и её услугам. "
-        "Не давай диагнозов, не назначай лечение, не интерпретируй анализы. "
-        "Если вопрос медицинский — мягко предложи записаться к врачу. "
-        "Коротко, понятно, дружелюбно. Если ответ неочевиден — скажи, что уточним у администратора.\n\n"
-        f"Контекст (справочно):\n"
-        f"- Режим работы: {ctx.get('hours')}\n"
-        f"- Адрес: {ctx.get('address')}\n"
-        f"- Телефон: {ctx.get('phone')}\n"
-        f"- Руководитель: {ctx.get('manager')}\n"
-        f"- Услуги: {ctx.get('services')}\n"
-        f"- Акции: {ctx.get('promos')}\n"
-        f"- Врачи: {', '.join(ctx.get('doctors', []))}\n"
-        "Если информации нет — так и скажи и предложи связать с администратором."
-    )
+def _ai_client():
+    if not OPENAI_API_KEY: return None
+    return OpenAI(api_key=OPENAI_API_KEY)
 
 def ai_answer(question: str) -> str:
-    if not OPENAI_API_KEY:
-        return ""
-    client = oa_client or OpenAI(api_key=OPENAI_API_KEY)
-    ctx = _collect_context_for_ai()
-    system = _ai_prompt_system(ctx)
+    client=_ai_client()
+    if not client: return ""
+    ctx=_collect_context_for_ai()
+    system=(
+        "Ты — 'МедНавигатор РГ Клиник', справочный помощник. "
+        "Отвечай только по организации работы клиники, услугам и подготовке. "
+        "Не давай диагнозов и лечения. Кратко, дружелюбно."
+        f"\nКонтекст: часы={ctx['hours']}; адрес={ctx['address']}; телефон={ctx['phone']}; "
+        f"услуги={ctx['services']}; акции={ctx['promos']}; руководитель={ctx['manager']}; "
+        f"врачи={', '.join(ctx['doctors'])}."
+    )
     try:
-        # компактная и дешёвая модель, можно заменить на gpt-4o
-        resp = client.chat.completions.create(
+        r=client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": question.strip()},
-            ],
-            temperature=0.3,
-            max_tokens=400,
+            messages=[{"role":"system","content":system},{"role":"user","content":question.strip()}],
+            temperature=0.3, max_tokens=400,
         )
-        text = (resp.choices[0].message.content or "").strip()
-        return text
+        return (r.choices[0].message.content or "").strip()
     except Exception as e:
-        logging.exception("AI answer failed: %s", e)
-        return ""
+        logging.exception("AI answer failed: %s", e); return ""
+
+def ai_format_prices(hits: list) -> str:
+    """Красиво форматирует найденные позиции прайса. Если OpenAI недоступен — стандартный вывод."""
+    if not hits: return ""
+    client=_ai_client()
+    plain = []
+    for h in hits:
+        line=f"{h.get('name','')}"
+        if h.get("code"): line+=f" ({h.get('code')})"
+        if h.get("price"): line+=f" — {h.get('price')}"
+        if h.get("tat_days"): line+=f", срок: {h.get('tat_days')}"
+        if h.get("notes"): line+=f". {h.get('notes')}"
+        plain.append(line)
+    if not client:
+        return "Найдено:\n• " + "\n• ".join(plain)
+    prompt = (
+        "Оформи кратко и понятно список медицинских услуг РГ Клиник для пациента. "
+        "Каждый пункт: имя, код, цена, срок, короткая приметка (если есть). Без советов по лечению.\n\n"
+        "Список:\n- " + "\n- ".join(plain)
+    )
+    try:
+        r=client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":"Ты форматируешь прайс-списки медуслуг для пациентов, лаконично и понятно."},
+                      {"role":"user","content":prompt}],
+            temperature=0.2, max_tokens=350
+        )
+        return (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        logging.exception("AI format prices failed: %s", e)
+        return "Найдено:\n• " + "\n• ".join(plain)
+
+TEMPLATE_TYPES = {
+    "confirm_appointment": "Подтверждение записи на приём",
+    "prep_instructions":  "Памятка по подготовке к анализу/исследованию",
+    "results_ready":      "Готовность результатов",
+    "promo":              "Инфосообщение/акция",
+}
+
+def ai_generate_template(tpl_type: str) -> str:
+    """Генерирует текст шаблона с плейсхолдерами. Строго справочно, без медицины."""
+    client=_ai_client()
+    ctx=_collect_context_for_ai()
+    placeholders = (
+        "{patient_name}, {date}, {time}, {doctor}, {service}, {address}, {phone}, "
+        "{price}, {tat_days}, {promo_name}, {promo_until}"
+    )
+    base = (
+        "Сгенерируй краткий русскоязычный шаблон сообщения для клиники. "
+        "Стиль: дружелюбно, уважительно, без медицинских рекомендаций. "
+        "Добавь уместные плейсхолдеры в фигурных скобках. "
+        f"Доступные плейсхолдеры: {placeholders}. "
+        f"Контекст: адрес={ctx['address']}, телефон={ctx['phone']}, часы={ctx['hours']}."
+    )
+    if tpl_type=="confirm_appointment":
+        user = base + " Тип: подтверждение записи на приём."
+    elif tpl_type=="prep_instructions":
+        user = base + " Тип: памятка по подготовке к анализу/исследованию (общие правила натощак и т.д.)."
+    elif tpl_type=="results_ready":
+        user = base + " Тип: уведомление о готовности результатов анализов."
+    elif tpl_type=="promo":
+        user = base + " Тип: сообщение об акции/скидке клиники."
+    else:
+        return "Неизвестный тип. Доступно: " + ", ".join(f"{k} — {v}" for k,v in TEMPLATE_TYPES.items())
+    if not client:
+        # Фолбэк: простая заготовка
+        samples = {
+            "confirm_appointment": "Здравствуйте, {patient_name}! Подтверждаем запись к {doctor} на {date} в {time}. Адрес: {address}. Тел.: {phone}.",
+            "prep_instructions":  "Здравствуйте, {patient_name}! Направляем памятку к услуге «{service}». За 8–12 часов — не есть; воду можно. Адрес: {address}, тел.: {phone}.",
+            "results_ready":      "Здравствуйте, {patient_name}! Результаты по «{service}» готовы. Вы можете получить их в личном кабинете или в клинике. Тел.: {phone}.",
+            "promo":              "Здравствуйте! В РГ Клиник действует акция «{promo_name}» до {promo_until}. Подробности: {phone}."
+        }
+        return samples.get(tpl_type, "Шаблон недоступен без OPENAI_API_KEY.")
+    try:
+        r=_ai_client().chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":"Ты создаёшь краткие шаблоны сообщений для медклиники. Без советов по лечению."},
+                      {"role":"user","content":user}],
+            temperature=0.4, max_tokens=300
+        )
+        return (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        logging.exception("AI template failed: %s", e)
+        return "Не удалось сгенерировать шаблон. Попробуйте позже."
 
 # ---------- Handlers ----------
 ASK_DOCTOR, ASK_SLOT, ASK_FIO, ASK_PHONE, ASK_DATE = range(5)
@@ -485,7 +551,7 @@ async def record_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Запись подтверждена:\n{info.get('doctor_full_name','')}\n{info.get('date','')} {info.get('time','')}\nПациент: {fio}\nТелефон: {phone}")
     await _safe_text_kb(update, "Главное меню:", main_menu()); return ConversationHandler.END
 
-# --- Меню-клики (все ответы через smart_reply -> озвучиваются)
+# --- Меню-клики
 async def menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer(); data=q.data
     if data=="PRICES":
@@ -502,7 +568,20 @@ async def menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_text_kb(update, "Главное меню:", main_menu())
         return
 
-# --- FAQ router (правила + GPT fallback)
+# --- Templates
+async def templates_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [f"• {k} — {v}" for k,v in TEMPLATE_TYPES.items()]
+    await smart_reply(update, "Доступные шаблоны:\n" + "\n".join(lines) + "\n\nСгенерировать: /gen_template <type>")
+
+async def gen_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await smart_reply(update, "Укажите тип. Пример: /gen_template confirm_appointment\nДоступные: " + ", ".join(TEMPLATE_TYPES.keys()))
+        return
+    t=context.args[0].strip()
+    txt=ai_generate_template(t)
+    await smart_reply(update, txt)
+
+# --- FAQ router (правила + AI price format + GPT fallback)
 async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text=(update.message.text or "").strip()
     if not text: return
@@ -544,32 +623,25 @@ async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(k in tl for k in ["услуг","направлени","что лечите","что делаете"]):
         await smart_reply(update, f"🩺 Услуги клиники:\n{info_get('clinic_services','Перечень услуг — в листе Prices.')}"); return
 
-    # Памятки / Прайс
+    # Памятки
     prep_hits=prep_search_q(text,3)
     if prep_hits:
         await smart_reply(update, "\n\n".join([f"• *{h.get('test_name','')}*\n{h.get('memo','')}" for h in prep_hits]))
         await _safe_text_kb(update, "Выберите раздел ниже 👇", main_menu()); return
-    price_hits=prices_search_q(text,5)
-    if price_hits:
-        lines=[]
-        for h in price_hits:
-            line=f"• *{h.get('name','')}*"
-            if h.get("code"):     line += f" (`{h.get('code')}`)"
-            if h.get("price"):    line += f" — {h.get('price')}"
-            if h.get("tat_days"): line += f", срок: {h.get('tat_days')}"
-            if h.get("notes"):    line += f"\n  _{h.get('notes')}_"
-            lines.append(line)
-        await smart_reply(update, "\n".join(lines))
-        await _safe_text_kb(update, "Выберите раздел ниже 👇", main_menu()); return
 
-    # ---- GPT fallback (справочно) ----
+    # Прайс — AI форматирование
+    price_hits=prices_search_q(text,8)
+    if price_hits:
+        pretty = ai_format_prices(price_hits)
+        await smart_reply(update, pretty)
+        await _safe_text_kb(update, "Хотите записаться или задать вопрос? 👇", main_menu()); return
+
+    # GPT fallback
     ai = ai_answer(text)
     if ai:
         await smart_reply(update, ai)
-        await _safe_text_kb(update, "Нужна запись или другая справка? Выберите ниже 👇", main_menu())
-        return
+        await _safe_text_kb(update, "Нужна запись или другая справка? Выберите ниже 👇", main_menu()); return
 
-    # если совсем ничего
     await _safe_text_kb(update, "Я вас понял. Выберите раздел ниже 👇", main_menu())
 
 # --- Голосовые сообщения
@@ -593,6 +665,11 @@ async def voice_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode="голос+текст" if VOICE_TEXT_DUP=="1" else "только голос"
     await smart_reply(update, f"ℹ️ Режим: {on} ({mode})")
 
+# --- Templates commands
+# /templates — список; /gen_template <type> — сгенерировать
+# (для отправки пациенту админ копирует текст и подставляет плейсхолдеры)
+# Можно позже сделать /broadcast (с осторожностью)
+# ----------------------------------
 # --- Error handler
 _last_conflict=0
 async def error_handler(update, context):
@@ -639,6 +716,10 @@ def build_app():
     app.add_handler(CommandHandler("voice_on", voice_on))
     app.add_handler(CommandHandler("voice_off", voice_off))
     app.add_handler(CommandHandler("voice_status", voice_status))
+
+    # шаблоны
+    app.add_handler(CommandHandler("templates", templates_list))
+    app.add_handler(CommandHandler("gen_template", gen_template))
 
     # кнопки
     app.add_handler(CallbackQueryHandler(menu_click, pattern="^(PRICES|PREP|CONTACTS)$"))
