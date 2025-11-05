@@ -1,7 +1,8 @@
-# bot.py — МедНавигатор РГ Клиник (v8.2)
-# + AI price formatting (из листа Prices)
-# + AI templates (/templates, /gen_template <type>)
-# Остальное — как в v8.1 (запись, голос, справка, доктора и т.п.)
+# bot.py — МедНавигатор РГ Клиник (v8.4)
+# База: v8.3 (запись, FAQ, AI, прайс, шаблоны, рассылки)
+# Патчи:
+#  • FAQ понимает "главный врач" / "кто руководитель" и берёт Info['chief_doctor'] или ['clinic_manager']
+#  • Голосовой хендлер без сообщения "Распознал:", сразу даёт ответ
 
 import os, re, json, time, logging
 from io import BytesIO
@@ -12,7 +13,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Conflict
+from telegram.error import Conflict, BadRequest
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ConversationHandler, ContextTypes, filters
@@ -25,23 +26,28 @@ try:
 except Exception:
     TTS_AVAILABLE = False
 
-from openai import OpenAI
+# ---------- OpenAI ----------
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 # ---------- ENV ----------
 BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN")
 SPREADSHEET_ID   = os.getenv("GOOGLE_SPREADSHEET_ID")
 SERVICE_JSON     = os.getenv("GOOGLE_SERVICE_ACCOUNT")
-ADMIN_CHAT_ID    = os.getenv("ADMIN_CHAT_ID")
+ADMIN_CHAT_ID    = os.getenv("ADMIN_CHAT_ID")  # для рассылок/админ-команд
 
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
 VOICE_TEXT_DUP   = os.getenv("VOICE_TEXT_DUPLICATE", "1")  # "1" голос+текст, "0" только голос
 
-SCHEDULE_SHEET = os.getenv("GOOGLE_SCHEDULE_SHEET", "Schedule")
-REQUESTS_SHEET = os.getenv("GOOGLE_REQUESTS_SHEET", "Requests")
-PRICES_SHEET   = os.getenv("GOOGLE_PRICES_SHEET", "Prices")
-PREP_SHEET     = os.getenv("GOOGLE_PREP_SHEET", "Prep")
-DOCTORS_SHEET  = "Doctors"
-INFO_SHEET     = "Info"
+SCHEDULE_SHEET   = os.getenv("GOOGLE_SCHEDULE_SHEET", "Schedule")
+REQUESTS_SHEET   = os.getenv("GOOGLE_REQUESTS_SHEET", "Requests")
+PRICES_SHEET     = os.getenv("GOOGLE_PRICES_SHEET", "Prices")
+PREP_SHEET       = os.getenv("GOOGLE_PREP_SHEET", "Prep")
+DOCTORS_SHEET    = "Doctors"
+INFO_SHEET       = "Info"
+SUBSCRIBERS_SHEET= "Subscribers"  # база подписчиков для рассылок
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 
@@ -62,13 +68,14 @@ def main_menu():
 
 # ---------- Google Sheets ----------
 HEADERS = {
-    SCHEDULE_SHEET: ["slot_id","doctor_id","doctor_name","specialty","date","time","tz","status",
-                     "patient_full_name","patient_phone","created_at","updated_at"],
-    REQUESTS_SHEET: ["appointment_id","patient_full_name","patient_phone","doctor_full_name",
-                     "date","time","datetime_iso","status"],
-    PRICES_SHEET:   ["code","name","price","tat_days","notes"],
-    PREP_SHEET:     ["test_name","memo"],
-    INFO_SHEET:     ["key","value"],
+    SCHEDULE_SHEET:   ["slot_id","doctor_id","doctor_name","specialty","date","time","tz","status",
+                       "patient_full_name","patient_phone","created_at","updated_at"],
+    REQUESTS_SHEET:   ["appointment_id","patient_full_name","patient_phone","doctor_full_name",
+                       "date","time","datetime_iso","status"],
+    PRICES_SHEET:     ["code","name","price","tat_days","notes"],
+    PREP_SHEET:       ["test_name","memo"],
+    INFO_SHEET:       ["key","value"],
+    SUBSCRIBERS_SHEET:["chat_id","name","consent","tags","created_at"],
 }
 
 def gs_client():
@@ -140,9 +147,14 @@ async def _safe_text_kb(update: Update, text: str | None, kb=None):
     await send((text or "").strip() or DEFAULT_EMPTY_REPLY, reply_markup=kb)
 
 # ---------- Voice (STT/TTS) ----------
-oa_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-VOICE_MODE_USERS = set()
+oa_client = None
+if OPENAI_API_KEY and OpenAI:
+    try:
+        oa_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        oa_client = None
 
+VOICE_MODE_USERS = set()
 def is_voice_enabled(uid: int): return uid in VOICE_MODE_USERS
 
 async def stt_transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -330,7 +342,7 @@ def _collect_context_for_ai():
     }
 
 def _ai_client():
-    if not OPENAI_API_KEY: return None
+    if not OPENAI_API_KEY or not OpenAI: return None
     return OpenAI(api_key=OPENAI_API_KEY)
 
 def ai_answer(question: str) -> str:
@@ -356,7 +368,6 @@ def ai_answer(question: str) -> str:
         logging.exception("AI answer failed: %s", e); return ""
 
 def ai_format_prices(hits: list) -> str:
-    """Красиво форматирует найденные позиции прайса. Если OpenAI недоступен — стандартный вывод."""
     if not hits: return ""
     client=_ai_client()
     plain = []
@@ -394,7 +405,6 @@ TEMPLATE_TYPES = {
 }
 
 def ai_generate_template(tpl_type: str) -> str:
-    """Генерирует текст шаблона с плейсхолдерами. Строго справочно, без медицины."""
     client=_ai_client()
     ctx=_collect_context_for_ai()
     placeholders = (
@@ -403,7 +413,7 @@ def ai_generate_template(tpl_type: str) -> str:
     )
     base = (
         "Сгенерируй краткий русскоязычный шаблон сообщения для клиники. "
-        "Стиль: дружелюбно, уважительно, без медицинских рекомендаций. "
+        "Стиль: дружелюбно и уважительно, без медицинских рекомендаций. "
         "Добавь уместные плейсхолдеры в фигурных скобках. "
         f"Доступные плейсхолдеры: {placeholders}. "
         f"Контекст: адрес={ctx['address']}, телефон={ctx['phone']}, часы={ctx['hours']}."
@@ -411,7 +421,7 @@ def ai_generate_template(tpl_type: str) -> str:
     if tpl_type=="confirm_appointment":
         user = base + " Тип: подтверждение записи на приём."
     elif tpl_type=="prep_instructions":
-        user = base + " Тип: памятка по подготовке к анализу/исследованию (общие правила натощак и т.д.)."
+        user = base + " Тип: памятка по подготовке к анализу/исследованию (общие правила)."
     elif tpl_type=="results_ready":
         user = base + " Тип: уведомление о готовности результатов анализов."
     elif tpl_type=="promo":
@@ -419,16 +429,15 @@ def ai_generate_template(tpl_type: str) -> str:
     else:
         return "Неизвестный тип. Доступно: " + ", ".join(f"{k} — {v}" for k,v in TEMPLATE_TYPES.items())
     if not client:
-        # Фолбэк: простая заготовка
         samples = {
             "confirm_appointment": "Здравствуйте, {patient_name}! Подтверждаем запись к {doctor} на {date} в {time}. Адрес: {address}. Тел.: {phone}.",
-            "prep_instructions":  "Здравствуйте, {patient_name}! Направляем памятку к услуге «{service}». За 8–12 часов — не есть; воду можно. Адрес: {address}, тел.: {phone}.",
-            "results_ready":      "Здравствуйте, {patient_name}! Результаты по «{service}» готовы. Вы можете получить их в личном кабинете или в клинике. Тел.: {phone}.",
-            "promo":              "Здравствуйте! В РГ Клиник действует акция «{promo_name}» до {promo_until}. Подробности: {phone}."
+            "prep_instructions":  "Здравствуйте, {patient_name}! Памятка к услуге «{service}»: за 8–12 часов — не есть; воду можно. Адрес: {address}, тел.: {phone}.",
+            "results_ready":      "Здравствуйте, {patient_name}! Результаты по «{service}» готовы. Получить в ЛК или в клинике. Тел.: {phone}.",
+            "promo":              "Здравствуйте! В РГ Клиник — «{promo_name}» до {promo_until}. Подробности: {phone}."
         }
         return samples.get(tpl_type, "Шаблон недоступен без OPENAI_API_KEY.")
     try:
-        r=_ai_client().chat.completions.create(
+        r=client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"system","content":"Ты создаёшь краткие шаблоны сообщений для медклиники. Без советов по лечению."},
                       {"role":"user","content":user}],
@@ -438,6 +447,67 @@ def ai_generate_template(tpl_type: str) -> str:
     except Exception as e:
         logging.exception("AI template failed: %s", e)
         return "Не удалось сгенерировать шаблон. Попробуйте позже."
+
+# ---------- Templating & Broadcast ----------
+def parse_params(s: str) -> dict:
+    out={}
+    for part in re.split(r"[;\n]", s or ""):
+        if not part.strip(): continue
+        if "=" not in part: continue
+        k,v = part.split("=",1)
+        out[k.strip()] = v.strip()
+    return out
+
+def render_template(text: str, params: dict) -> str:
+    def repl(m):
+        key=m.group(1)
+        return str(params.get(key, "{"+key+"}"))
+    return re.sub(r"\{([a-zA-Z0-9_]+)\}", repl, text or "")
+
+def ensure_subscriber(chat_id: int, name: str, tags: str=""):
+    ws = open_ws(SUBSCRIBERS_SHEET)
+    header, rows = read_all(ws)
+    if not header: ws.append_row(HEADERS[SUBSCRIBERS_SHEET])
+    for i, r in enumerate(rows, start=2):
+        if str(r[0]).strip()==str(chat_id):
+            row = r[:]
+            while len(row) < len(HEADERS[SUBSCRIBERS_SHEET]): row.append("")
+            row[1]=name or row[1]
+            row[2]="1"
+            if tags: row[3]=tags
+            row[4]=datetime.now().isoformat(timespec="seconds")
+            end_col=chr(64+len(HEADERS[SUBSCRIBERS_SHEET]))
+            ws.update(f"A{i}:{end_col}{i}", [row]); return
+    ws.append_row([str(chat_id), name, "1", tags or "", datetime.now().isoformat(timespec="seconds")])
+
+def remove_subscriber(chat_id: int):
+    ws = open_ws(SUBSCRIBERS_SHEET)
+    header, rows = read_all(ws)
+    if not header: return
+    for i, r in enumerate(rows, start=2):
+        if str(r[0]).strip()==str(chat_id):
+            ws.delete_rows(i); return
+
+def iter_subscribers(require_consent=True, tags_any: list[str] | None = None):
+    ws=open_ws(SUBSCRIBERS_SHEET)
+    rows=ws.get_all_records()
+    out=[]
+    for r in rows:
+        try:
+            chat_id=int(str(r.get("chat_id","")).strip())
+        except Exception:
+            continue
+        consent=str(r.get("consent","1")).strip()
+        if require_consent and consent!="1":
+            continue
+        tags=str(r.get("tags","")).strip().lower()
+        if tags_any:
+            set_user=set(re.split(r"[,\s]+", tags)) if tags else set()
+            set_need=set([t.strip().lower() for t in tags_any if t.strip()])
+            if set_need and not (set_user & set_need):
+                continue
+        out.append({"chat_id": chat_id, "name": r.get("name",""), "tags": tags})
+    return out
 
 # ---------- Handlers ----------
 ASK_DOCTOR, ASK_SLOT, ASK_FIO, ASK_PHONE, ASK_DATE = range(5)
@@ -457,12 +527,26 @@ async def fix_headers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fix_headers_force()
     await smart_reply(update, "✅ Заголовки колонок обновлены: " + ", ".join(HEADERS.keys()))
 
+# ---- Подписки пользователей
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tags = " ".join(context.args).strip() if context.args else ""
+    user = update.effective_user
+    ensure_subscriber(user.id, f"{user.first_name or ''} {user.last_name or ''}".strip(), tags)
+    await smart_reply(update, "Вы подписаны на уведомления клиники ✅")
+
+async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    remove_subscriber(user.id)
+    await smart_reply(update, "Подписка отключена. Вы больше не будете получать массовые уведомления.")
+
+# ---- Отмена записи
 async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await smart_reply(update, "Укажите slot_id. Пример:\n/cancel_booking DOC01-2025-10-28-09:00"); return
     ok = update_slot(context.args[0], "FREE", "", "")
     await smart_reply(update, "✅ Слот освобождён" if ok else "❌ Не удалось отменить (slot_id/статус).")
 
+# ---- Диагностика слотов
 async def debug_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query=" ".join(context.args).strip() if context.args else ""
     try: slots=find_free_slots(query, page=0, page_size=10, date_filter=None)
@@ -568,7 +652,7 @@ async def menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_text_kb(update, "Главное меню:", main_menu())
         return
 
-# --- Templates
+# --- Templates commands
 async def templates_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"• {k} — {v}" for k,v in TEMPLATE_TYPES.items()]
     await smart_reply(update, "Доступные шаблоны:\n" + "\n".join(lines) + "\n\nСгенерировать: /gen_template <type>")
@@ -580,6 +664,67 @@ async def gen_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t=context.args[0].strip()
     txt=ai_generate_template(t)
     await smart_reply(update, txt)
+
+# --- Broadcast (admin only)
+def _is_admin(update: Update) -> bool:
+    if not ADMIN_CHAT_ID:
+        return False
+    try:
+        return int(ADMIN_CHAT_ID) == (update.effective_user.id if update.effective_user else 0)
+    except Exception:
+        return False
+
+async def broadcast_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await smart_reply(update, "Команда доступна только администратору."); return
+    if len(context.args) < 1:
+        await smart_reply(update, "Формат: /broadcast_preview <type> | key=value; ...\nПример:\n/broadcast_preview promo | promo_name=Осенний чек-ап; promo_until=30.11; phone=+7..."); return
+    raw = " ".join(context.args)
+    parts = raw.split("|", 1)
+    tpl_type = parts[0].strip()
+    params = parse_params(parts[1]) if len(parts) > 1 else {}
+    tpl = ai_generate_template(tpl_type)
+    msg = render_template(tpl, params)
+    await smart_reply(update, f"📄 Превью рассылки ({tpl_type}):\n\n{msg}\n\nПодписчики: {len(iter_subscribers(True))}\nФильтр по тегам можно указать в /broadcast")
+
+async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await smart_reply(update, "Команда доступна только администратору."); return
+    if len(context.args) < 1:
+        await smart_reply(update, "Формат: /broadcast <type> | key=value; ... | tags=a,b"); return
+    raw = " ".join(context.args)
+    parts = [p.strip() for p in raw.split("|")]
+    tpl_type = parts[0].strip()
+    params = parse_params(parts[1]) if len(parts) >= 2 else {}
+    tag_list = []
+    if len(parts) >= 3:
+        tag_params = parse_params(parts[2])
+        tags_raw = tag_params.get("tags","")
+        if tags_raw:
+            tag_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
+
+    tpl = ai_generate_template(tpl_type)
+    base_msg = tpl or ""
+    subs = iter_subscribers(require_consent=True, tags_any=tag_list if tag_list else None)
+    total=len(subs); ok=0; fail=0
+    await smart_reply(update, f"🚀 Старт рассылки: получателей {total}. Тип: {tpl_type}. Фильтр тегов: {', '.join(tag_list) if tag_list else '—'}")
+
+    for i, s in enumerate(subs, start=1):
+        per_params = dict(params)
+        if s.get("name"): per_params.setdefault("patient_name", s["name"])
+        msg = render_template(base_msg, per_params).strip() or "Информационное сообщение РГ Клиник."
+        try:
+            await context.bot.send_message(chat_id=s["chat_id"], text=msg)
+            ok += 1
+        except BadRequest as e:
+            fail += 1; logging.warning("Broadcast fail [%s]: %s", s["chat_id"], e)
+        except Exception as e:
+            fail += 1; logging.exception("Broadcast error [%s]: %s", s["chat_id"], e)
+        if i % 25 == 0:
+            await smart_reply(update, f"Статус: {i}/{total} отправлено…")
+        time.sleep(0.05)
+
+    await smart_reply(update, f"✅ Рассылка завершена. Успешно: {ok}, ошибок: {fail} из {total}.")
 
 # --- FAQ router (правила + AI price format + GPT fallback)
 async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -611,8 +756,15 @@ async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Быстрые справки из Info
     if any(k in tl for k in ["график работы","режим работы","часы работы","когда открыты"]):
         await smart_reply(update, f"🕘 График работы: {info_get('clinic_hours','пн–пт 08:00–20:00; сб–вс 09:00–18:00')}"); return
-    if any(k in tl for k in ["руководител","директор","главврач","управляющ"]):
-        await smart_reply(update, f"👤 Руководитель: {info_get('clinic_manager','Информация уточняется')}"); return
+
+    # Патч: главный врач / руководитель
+    if any(k in tl for k in ["руководител","директор","главврач","главный врач","кто главный врач","кто руководитель","управляющ"]):
+        chief = info_get("chief_doctor", "").strip()
+        if not chief:
+            chief = info_get("clinic_manager", "Информация уточняется").strip()
+        await smart_reply(update, f"👤 Главный врач / Руководитель: {chief}")
+        return
+
     if any(k in tl for k in ["акци","скидк","предложени"]):
         await smart_reply(update, f"🎉 Акции:\n{info_get('clinic_promos','Сейчас активных акций нет.')}"); return
     if any(k in tl for k in ["контакт","адрес","телефон"]):
@@ -644,11 +796,13 @@ async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _safe_text_kb(update, "Я вас понял. Выберите раздел ниже 👇", main_menu())
 
-# --- Голосовые сообщения
+# --- Голосовые сообщения (тихий режим)
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await stt_transcribe_voice(update, context)
-    if not text: return
-    await smart_reply(update, f"🗣 Распознал: {text}")
+    if not text:
+        return
+    # Если хочется видеть распознанный текст — раскомментируйте строку ниже:
+    # await smart_reply(update, f"🗣 Распознал: {text}")
     context.user_data["_override_text"]=text
     await faq_router(update, context)
     context.user_data.pop("_override_text", None)
@@ -665,11 +819,6 @@ async def voice_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode="голос+текст" if VOICE_TEXT_DUP=="1" else "только голос"
     await smart_reply(update, f"ℹ️ Режим: {on} ({mode})")
 
-# --- Templates commands
-# /templates — список; /gen_template <type> — сгенерировать
-# (для отправки пациенту админ копирует текст и подставляет плейсхолдеры)
-# Можно позже сделать /broadcast (с осторожностью)
-# ----------------------------------
 # --- Error handler
 _last_conflict=0
 async def error_handler(update, context):
@@ -704,24 +853,32 @@ def build_app():
         allow_reentry=True,
     )
 
-    # команды
+    # Базовые команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("init_sheets", init_sheets))
     app.add_handler(CommandHandler("fix_headers", fix_headers))
     app.add_handler(CommandHandler("debug_slots", debug_slots))
+
+    # Подписки/рассылки
+    app.add_handler(CommandHandler("subscribe", subscribe))
+    app.add_handler(CommandHandler("unsubscribe", unsubscribe))
+    app.add_handler(CommandHandler("broadcast_preview", broadcast_preview))
+    app.add_handler(CommandHandler("broadcast", broadcast_send))
+
+    # Отмена записи
     app.add_handler(CommandHandler("cancel_booking", cancel_booking))
 
-    # голосовой режим
+    # Голосовой режим
     app.add_handler(CommandHandler("voice_on", voice_on))
     app.add_handler(CommandHandler("voice_off", voice_off))
     app.add_handler(CommandHandler("voice_status", voice_status))
 
-    # шаблоны
+    # Шаблоны
     app.add_handler(CommandHandler("templates", templates_list))
     app.add_handler(CommandHandler("gen_template", gen_template))
 
-    # кнопки
+    # Кнопки
     app.add_handler(CallbackQueryHandler(menu_click, pattern="^(PRICES|PREP|CONTACTS)$"))
 
     # FSM и обработчики
