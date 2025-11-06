@@ -1,8 +1,9 @@
-# bot.py — МедНавигатор РГ Клиник (v8.5)
-# Новое в v8.5:
-# • FIX: кнопки "Ещё слоты"/"На другой день" теперь создаются с callback_data=..., без ошибки "url 'more' is invalid"
-# • FIX: голос — используем download_as_bytearray() для совместимости с PTB 20.x
-# Основа: v8.4 (запись, FAQ, AI-справки, прайс-форматтер, шаблоны, массовые рассылки)
+# bot.py — МедНавигатор РГ Клиник (v8.5.1)
+# Новое в v8.5.1:
+# • Голос: поддержка VOICE и AUDIO, download_as_bytearray(), индикатор "Распознаю аудио…",
+#   расширенные логи и дружественные сообщения об ошибках (quota/auth).
+# • Кнопки "Ещё слоты / На другой день" фиксированы через callback_data.
+# • Всё остальное — как в v8.5 (запись, FAQ, AI-справки, прайс-форматтер, шаблоны, рассылки).
 
 import os, re, json, time, logging
 from io import BytesIO
@@ -158,22 +159,34 @@ VOICE_MODE_USERS = set()
 def is_voice_enabled(uid: int): return uid in VOICE_MODE_USERS
 
 async def stt_transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Скачиваем voice как bytearray и отправляем в Whisper."""
+    """Скачиваем voice/audio как bytearray и отправляем в Whisper."""
     if not oa_client:
         await _safe_text(update, "Распознавание недоступно — нет OPENAI_API_KEY.")
         return ""
     try:
-        tg_file = await context.bot.get_file(update.message.voice.file_id)
-        voice_bytes = await tg_file.download_as_bytearray()     # надёжно в PTB 20.x
+        file_id = (update.message.voice.file_id if update.message.voice
+                   else update.message.audio.file_id)
+        tg_file = await context.bot.get_file(file_id)
+        voice_bytes = await tg_file.download_as_bytearray()
         bio = BytesIO(voice_bytes)
+
         resp = oa_client.audio.transcriptions.create(
             model="whisper-1",
             file=("voice.ogg", bio, "audio/ogg")
         )
-        return (getattr(resp, "text", "") or "").strip()
+        text = (getattr(resp, "text", "") or "").strip()
+        logging.info("Whisper text: %s", text)
+        return text
+
     except Exception as e:
         logging.exception("STT error: %s", e)
-        await _safe_text(update, "Не удалось распознать речь. Убедитесь, что это русский язык, и повторите.")
+        msg = str(e)
+        if "insufficient_quota" in msg.lower():
+            await _safe_text(update, "Распознавание недоступно: исчерпан лимит OpenAI (quota).")
+        elif "api_key" in msg.lower() or "authentication" in msg.lower():
+            await _safe_text(update, "Ошибка авторизации OpenAI API. Проверьте OPENAI_API_KEY.")
+        else:
+            await _safe_text(update, "Не удалось распознать речь. Убедитесь, что это русский язык, и повторите.")
         return ""
 
 async def tts_send(update: Update, text: str):
@@ -389,7 +402,7 @@ def ai_format_prices(hits: list) -> str:
     try:
         r=client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":"Ты форматируешь прайс-списки медуслуг для пациентов, лаконично и понятно."},
+            messages=[{"role":"system","content":"Ты форматируешь прайс-списки медуслуг для клиентов, лаконично и понятно."},
                       {"role":"user","content":prompt}],
             temperature=0.2, max_tokens=350
         )
@@ -732,7 +745,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- FAQ router
 async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text=(update.message.text or "").strip()
+    text = context.user_data.pop("_override_text", None) or (update.message.text or "").strip()
     if not text: return
     tl=text.lower()
 
@@ -800,16 +813,31 @@ async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _safe_text_kb(update, "Я вас понял. Выберите раздел ниже 👇", main_menu())
 
-# --- Голосовые сообщения (тихий режим)
+# --- Голосовые сообщения
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = await stt_transcribe_voice(update, context)
-    if not text:
-        return
-    # при желании показывать распознанный текст — раскомментируйте:
-    # await smart_reply(update, f"🗣 Распознал: {text}")
-    context.user_data["_override_text"]=text
-    await faq_router(update, context)
-    context.user_data.pop("_override_text", None)
+    try:
+        v = update.message.voice or update.message.audio
+        if not v:
+            await _safe_text(update, "Не удалось получить аудио."); return
+
+        dur = getattr(v, "duration", None)
+        logging.info("Voice received: duration=%s sec, mime=%s", dur, getattr(v, "mime_type", "n/a"))
+        await _safe_text(update, "🗣 Распознаю аудио…")
+
+        text = await stt_transcribe_voice(update, context)
+        if not text:
+            return
+
+        # Хотите видеть распознанный — раскомментируйте:
+        # await _safe_text(update, f"🗣 Распознал: {text}")
+
+        context.user_data["_override_text"]=text
+        await faq_router(update, context)
+        context.user_data.pop("_override_text", None)
+
+    except Exception as e:
+        logging.exception("Voice handler error: %s", e)
+        await _safe_text(update, "Не удалось обработать аудио. Попробуйте ещё раз.")
 
 # --- Голосовой режим: переключатели
 async def voice_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -887,7 +915,7 @@ def build_app():
 
     # FSM и обработчики
     app.add_handler(conv)
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice), group=2)
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice), group=2)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, faq_router), group=2)
 
     app.add_error_handler(error_handler)
