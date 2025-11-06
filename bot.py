@@ -1,8 +1,8 @@
-# bot.py — МедНавигатор РГ Клиник (v8.4)
-# База: v8.3 (запись, FAQ, AI, прайс, шаблоны, рассылки)
-# Патчи:
-#  • FAQ понимает "главный врач" / "кто руководитель" и берёт Info['chief_doctor'] или ['clinic_manager']
-#  • Голосовой хендлер без сообщения "Распознал:", сразу даёт ответ
+# bot.py — МедНавигатор РГ Клиник (v8.5)
+# Новое в v8.5:
+# • FIX: кнопки "Ещё слоты"/"На другой день" теперь создаются с callback_data=..., без ошибки "url 'more' is invalid"
+# • FIX: голос — используем download_as_bytearray() для совместимости с PTB 20.x
+# Основа: v8.4 (запись, FAQ, AI-справки, прайс-форматтер, шаблоны, массовые рассылки)
 
 import os, re, json, time, logging
 from io import BytesIO
@@ -158,21 +158,22 @@ VOICE_MODE_USERS = set()
 def is_voice_enabled(uid: int): return uid in VOICE_MODE_USERS
 
 async def stt_transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Скачиваем voice как bytearray и отправляем в Whisper."""
     if not oa_client:
         await _safe_text(update, "Распознавание недоступно — нет OPENAI_API_KEY.")
         return ""
     try:
-        file = await context.bot.get_file(update.message.voice.file_id)
-        bio = BytesIO()
-        await file.download_to_memory(out=bio)  # PTB 20.x
-        bio.seek(0)
+        tg_file = await context.bot.get_file(update.message.voice.file_id)
+        voice_bytes = await tg_file.download_as_bytearray()     # надёжно в PTB 20.x
+        bio = BytesIO(voice_bytes)
         resp = oa_client.audio.transcriptions.create(
             model="whisper-1",
             file=("voice.ogg", bio, "audio/ogg")
         )
-        return getattr(resp, "text", "").strip()
+        return (getattr(resp, "text", "") or "").strip()
     except Exception as e:
-        await _safe_text(update, f"Ошибка распознавания речи: {e}")
+        logging.exception("STT error: %s", e)
+        await _safe_text(update, "Не удалось распознать речь. Убедитесь, что это русский язык, и повторите.")
         return ""
 
 async def tts_send(update: Update, text: str):
@@ -571,7 +572,8 @@ async def record_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_text_kb(update, "Выберите раздел ниже 👇", main_menu()); return ConversationHandler.END
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton(f"{s['doctor_name']} • {s['date']} {s['time']}", callback_data=f"SLOT::{s['slot_id']}")] for s in slots] +
-        [[InlineKeyboardButton("Ещё слоты ⏭️","MORE"), InlineKeyboardButton("На другой день 📅","ASKDATE")]]
+        [[InlineKeyboardButton("Ещё слоты ⏭️", callback_data="MORE"),
+          InlineKeyboardButton("На другой день 📅", callback_data="ASKDATE")]]
     )
     await _safe_text_kb(update, "Выберите слот:", kb); return ASK_SLOT
 
@@ -585,7 +587,8 @@ async def record_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _safe_text_kb(update, "Больше слотов не найдено.", main_menu()); return ConversationHandler.END
         kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton(f"{s['doctor_name']} • {s['date']} {s['time']}", callback_data=f"SLOT::{s['slot_id']}")] for s in slots] +
-            [[InlineKeyboardButton("Ещё слоты ⏭️","MORE"), InlineKeyboardButton("На другой день 📅","ASKDATE")]]
+            [[InlineKeyboardButton("Ещё слоты ⏭️", callback_data="MORE"),
+              InlineKeyboardButton("На другой день 📅", callback_data="ASKDATE")]]
         )
         await _safe_text_kb(update, "Ещё варианты:", kb); return ASK_SLOT
 
@@ -610,7 +613,8 @@ async def record_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_text_kb(update, "Выберите раздел ниже 👇", main_menu()); return ConversationHandler.END
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton(f"{s['doctor_name']} • {s['date']} {s['time']}", callback_data=f"SLOT::{s['slot_id']}")] for s in slots] +
-        [[InlineKeyboardButton("Ещё слоты ⏭️","MORE"), InlineKeyboardButton("На другой день 📅","ASKDATE")]]
+        [[InlineKeyboardButton("Ещё слоты ⏭️", callback_data="MORE"),
+          InlineKeyboardButton("На другой день 📅", callback_data="ASKDATE")]]
     )
     await _safe_text_kb(update, f"Свободные слоты на {d}:", kb); return ASK_SLOT
 
@@ -726,7 +730,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await smart_reply(update, f"✅ Рассылка завершена. Успешно: {ok}, ошибок: {fail} из {total}.")
 
-# --- FAQ router (правила + AI price format + GPT fallback)
+# --- FAQ router
 async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text=(update.message.text or "").strip()
     if not text: return
@@ -757,7 +761,7 @@ async def faq_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(k in tl for k in ["график работы","режим работы","часы работы","когда открыты"]):
         await smart_reply(update, f"🕘 График работы: {info_get('clinic_hours','пн–пт 08:00–20:00; сб–вс 09:00–18:00')}"); return
 
-    # Патч: главный врач / руководитель
+    # Главный врач / руководитель
     if any(k in tl for k in ["руководител","директор","главврач","главный врач","кто главный врач","кто руководитель","управляющ"]):
         chief = info_get("chief_doctor", "").strip()
         if not chief:
@@ -801,7 +805,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await stt_transcribe_voice(update, context)
     if not text:
         return
-    # Если хочется видеть распознанный текст — раскомментируйте строку ниже:
+    # при желании показывать распознанный текст — раскомментируйте:
     # await smart_reply(update, f"🗣 Распознал: {text}")
     context.user_data["_override_text"]=text
     await faq_router(update, context)
