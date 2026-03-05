@@ -27,7 +27,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
 SERVICE_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT")
-ADMIN_ID = os.getenv("ADMIN_ID")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # -------------------------
 # SHEETS
@@ -40,7 +40,10 @@ SHEET_INFO = "Инфо"
 # LOGGING
 # -------------------------
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 # -------------------------
 # GOOGLE
@@ -48,31 +51,58 @@ logging.basicConfig(level=logging.INFO)
 
 def gs():
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+    try:
 
-    creds = Credentials.from_service_account_info(
-        json.loads(SERVICE_JSON),
-        scopes=scopes
-    )
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
 
-    return gspread.authorize(creds)
+        creds = Credentials.from_service_account_info(
+            json.loads(SERVICE_JSON),
+            scopes=scopes
+        )
+
+        return gspread.authorize(creds)
+
+    except Exception as e:
+
+        logging.error("Google auth error", e)
+
+        return None
 
 
 def sheet(name):
 
-    gc = gs()
+    try:
 
-    return gc.open_by_key(SPREADSHEET_ID).worksheet(name)
+        gc = gs()
+
+        if not gc:
+            return None
+
+        return gc.open_by_key(SPREADSHEET_ID).worksheet(name)
+
+    except Exception as e:
+
+        logging.error("Sheet error", e)
+
+        return None
 
 
 def records(name):
 
     try:
-        return sheet(name).get_all_records()
+
+        ws = sheet(name)
+
+        if not ws:
+            return []
+
+        return ws.get_all_records()
+
     except:
+
         return []
 
 # -------------------------
@@ -85,9 +115,11 @@ def info(key):
 
     for r in rows:
 
-        if str(r.get("Ключ")).strip() == key:
+        k = str(r.get("Ключ","")).strip()
 
-            return str(r.get("Значение")).strip()
+        if k == key:
+
+            return str(r.get("Значение","")).strip()
 
     return ""
 
@@ -99,8 +131,8 @@ def menu():
 
     return InlineKeyboardMarkup([
 
-        [InlineKeyboardButton("📅 Запись", callback_data="record")],
-        [InlineKeyboardButton("📍 Контакты", callback_data="contacts")]
+        [InlineKeyboardButton("📅 Запись",callback_data="record")],
+        [InlineKeyboardButton("📍 Контакты",callback_data="contacts")]
 
     ])
 
@@ -111,8 +143,12 @@ def menu():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
-        "МедНавигатор РГ Клиник",
+
+        "👋 МедНавигатор РГ Клиник\n\n"
+        "Выберите действие:",
+
         reply_markup=menu()
+
     )
 
 # -------------------------
@@ -123,19 +159,19 @@ def doctors():
 
     rows = records(SHEET_SCHEDULE)
 
-    result = []
+    docs = []
 
     for r in rows:
 
-        if r.get("status") == "FREE":
+        if str(r.get("status","")).upper() == "FREE":
 
             d = r.get("doctor_name")
 
-            if d not in result:
+            if d and d not in docs:
 
-                result.append(d)
+                docs.append(d)
 
-    return result
+    return docs
 
 # -------------------------
 # DATES
@@ -149,7 +185,7 @@ def dates(doctor):
 
     for r in rows:
 
-        if r.get("doctor_name") == doctor and r.get("status") == "FREE":
+        if r.get("doctor_name") == doctor and str(r.get("status")).upper() == "FREE":
 
             d = r.get("date")
 
@@ -163,7 +199,7 @@ def dates(doctor):
 # TIMES
 # -------------------------
 
-def times(doctor, date):
+def times(doctor,date):
 
     rows = records(SHEET_SCHEDULE)
 
@@ -171,33 +207,49 @@ def times(doctor, date):
 
     for r in rows:
 
-        if r.get("doctor_name") == doctor and r.get("date") == date and r.get("status") == "FREE":
+        if (
+            r.get("doctor_name") == doctor
+            and r.get("date") == date
+            and str(r.get("status")).upper() == "FREE"
+        ):
 
             result.append(r)
 
     return result
 
 # -------------------------
-# BOOK SLOT
+# BOOK
 # -------------------------
 
-def book(slot_id, name, phone):
+def book(slot_id,name,phone):
 
-    ws = sheet(SHEET_SCHEDULE)
+    try:
 
-    rows = ws.get_all_records()
+        ws = sheet(SHEET_SCHEDULE)
 
-    for i, r in enumerate(rows, start=2):
+        rows = ws.get_all_records()
 
-        if str(r["slot_id"]) == str(slot_id) and r["status"] == "FREE":
+        for i,r in enumerate(rows,start=2):
 
-            ws.update_cell(i,8,"BOOKED")
-            ws.update_cell(i,9,name)
-            ws.update_cell(i,10,phone)
+            if str(r.get("slot_id")) == str(slot_id):
 
-            return True
+                if str(r.get("status")).upper() != "FREE":
 
-    return False
+                    return False
+
+                ws.update_cell(i,8,"BOOKED")
+                ws.update_cell(i,9,name)
+                ws.update_cell(i,10,phone)
+
+                return True
+
+        return False
+
+    except Exception as e:
+
+        logging.error("Booking error",e)
+
+        return False
 
 # -------------------------
 # MENU CLICK
@@ -210,13 +262,15 @@ async def menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = q.data
 
-    if data == "contacts":
+    try:
 
-        addr = info("clinic_address")
-        phone = info("clinic_phone")
-        hours = info("clinic_hours")
+        if data == "contacts":
 
-        await q.message.reply_text(
+            addr = info("clinic_address")
+            phone = info("clinic_phone")
+            hours = info("clinic_hours")
+
+            await q.message.reply_text(
 
 f"""📍 РГ Клиник
 
@@ -224,22 +278,35 @@ f"""📍 РГ Клиник
 Телефон: {phone}
 Режим работы: {hours}
 """
-        )
+            )
 
-    if data == "record":
+        if data == "record":
 
-        docs = doctors()
+            docs = doctors()
 
-        kb = []
+            if not docs:
 
-        for d in docs:
+                await q.message.reply_text("Нет свободных слотов")
 
-            kb.append([InlineKeyboardButton(d,callback_data=f"doc_{d}")])
+                return
 
-        await q.message.reply_text(
-            "Выберите врача",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
+            kb = []
+
+            for d in docs:
+
+                kb.append([InlineKeyboardButton(d,callback_data=f"doc_{d}")])
+
+            await q.message.reply_text(
+
+                "Выберите врача",
+
+                reply_markup=InlineKeyboardMarkup(kb)
+
+            )
+
+    except Exception as e:
+
+        logging.error(e)
 
 # -------------------------
 # DOCTOR CLICK
@@ -263,8 +330,11 @@ async def doctor_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb.append([InlineKeyboardButton(d,callback_data=f"date_{d}")])
 
     await q.message.reply_text(
+
         "Выберите дату",
+
         reply_markup=InlineKeyboardMarkup(kb)
+
     )
 
 # -------------------------
@@ -280,7 +350,7 @@ async def date_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["date"] = date
 
-    doctor = context.user_data["doctor"]
+    doctor = context.user_data.get("doctor")
 
     ts = times(doctor,date)
 
@@ -288,18 +358,19 @@ async def date_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for t in ts:
 
-        txt = t["time"]
-
         kb.append([
             InlineKeyboardButton(
-                txt,
-                callback_data=f"slot_{t['slot_id']}"
+                t.get("time"),
+                callback_data=f"slot_{t.get('slot_id')}"
             )
         ])
 
     await q.message.reply_text(
+
         "Выберите время",
+
         reply_markup=InlineKeyboardMarkup(kb)
+
     )
 
 # -------------------------
@@ -321,59 +392,64 @@ async def slot_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if "slot" in context.user_data and "name" not in context.user_data:
+    try:
 
-        context.user_data["name"] = update.message.text
+        if "slot" in context.user_data and "name" not in context.user_data:
 
-        await update.message.reply_text("Введите телефон")
+            context.user_data["name"] = update.message.text
 
-        return
+            await update.message.reply_text("Введите телефон")
 
-    if "slot" in context.user_data and "phone" not in context.user_data:
+            return
 
-        context.user_data["phone"] = update.message.text
+        if "slot" in context.user_data and "phone" not in context.user_data:
 
-        ok = book(
-            context.user_data["slot"],
-            context.user_data["name"],
-            context.user_data["phone"]
-        )
+            context.user_data["phone"] = update.message.text
 
-        if ok:
+            ok = book(
 
-            await update.message.reply_text("✅ Вы записаны")
+                context.user_data["slot"],
+                context.user_data["name"],
+                context.user_data["phone"]
 
-            if ADMIN_ID:
+            )
 
-                await context.bot.send_message(
-                    ADMIN_ID,
-f"""
-Новая запись
+            if ok:
+
+                await update.message.reply_text("✅ Вы записаны")
+
+                if ADMIN_ID:
+
+                    await context.bot.send_message(
+
+                        ADMIN_ID,
+
+f"""Новая запись
 
 Пациент: {context.user_data['name']}
 Телефон: {context.user_data['phone']}
 """
-                )
+                    )
 
-        context.user_data.clear()
+            else:
 
-        return
+                await update.message.reply_text("Слот уже занят")
 
-    text = update.message.text.lower()
+            context.user_data.clear()
 
-    medical_words = [
-        "анализ",
-        "врач",
-        "узи",
-        "клиник",
-        "прием"
-    ]
-
-    if not any(w in text for w in medical_words):
+            return
 
         await update.message.reply_text(
-            "Я помогаю только по вопросам клиники."
+
+            "Используйте кнопки меню 👇",
+
+            reply_markup=menu()
+
         )
+
+    except Exception as e:
+
+        logging.error(e)
 
 # -------------------------
 # MAIN
@@ -383,7 +459,7 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start",start))
 
     app.add_handler(
         CallbackQueryHandler(menu_click,pattern="^(record|contacts)$")
@@ -402,12 +478,12 @@ def main():
     )
 
     app.add_handler(
-        MessageHandler(filters.TEXT,text)
+        MessageHandler(filters.TEXT & ~filters.COMMAND,text)
     )
 
     print("Bot started")
 
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
