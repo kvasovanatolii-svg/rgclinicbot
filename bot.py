@@ -1,24 +1,112 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+import os
+import json
+import logging
 
-from config import BOT_TOKEN, ADMIN_ID
-from sheets import records
-from booking import free_slots, book_slot
-from ai import ai_answer
+import gspread
+from google.oauth2.service_account import Credentials
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
+
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
+
+# -------------------------
+# ENV
+# -------------------------
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
+SERVICE_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT")
+ADMIN_ID = os.getenv("ADMIN_ID")
+
+# -------------------------
+# SHEETS
+# -------------------------
+
+SHEET_SCHEDULE = "Расписание"
+SHEET_INFO = "Инфо"
+
+# -------------------------
+# LOGGING
+# -------------------------
+
+logging.basicConfig(level=logging.INFO)
+
+# -------------------------
+# GOOGLE
+# -------------------------
+
+def gs():
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    creds = Credentials.from_service_account_info(
+        json.loads(SERVICE_JSON),
+        scopes=scopes
+    )
+
+    return gspread.authorize(creds)
 
 
-BTN_RECORD = "📅 Запись"
-BTN_CONTACTS = "📍 Контакты"
+def sheet(name):
+
+    gc = gs()
+
+    return gc.open_by_key(SPREADSHEET_ID).worksheet(name)
+
+
+def records(name):
+
+    try:
+        return sheet(name).get_all_records()
+    except:
+        return []
+
+# -------------------------
+# INFO
+# -------------------------
+
+def info(key):
+
+    rows = records(SHEET_INFO)
+
+    for r in rows:
+
+        if str(r.get("Ключ")).strip() == key:
+
+            return str(r.get("Значение")).strip()
+
+    return ""
+
+# -------------------------
+# MENU
+# -------------------------
 
 def menu():
 
     return InlineKeyboardMarkup([
 
-        [InlineKeyboardButton(BTN_RECORD, callback_data="record")],
-        [InlineKeyboardButton(BTN_CONTACTS, callback_data="contacts")]
+        [InlineKeyboardButton("📅 Запись", callback_data="record")],
+        [InlineKeyboardButton("📍 Контакты", callback_data="contacts")]
 
     ])
 
+# -------------------------
+# START
+# -------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -27,48 +115,209 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=menu()
     )
 
+# -------------------------
+# DOCTORS
+# -------------------------
+
+def doctors():
+
+    rows = records(SHEET_SCHEDULE)
+
+    result = []
+
+    for r in rows:
+
+        if r.get("status") == "FREE":
+
+            d = r.get("doctor_name")
+
+            if d not in result:
+
+                result.append(d)
+
+    return result
+
+# -------------------------
+# DATES
+# -------------------------
+
+def dates(doctor):
+
+    rows = records(SHEET_SCHEDULE)
+
+    result = []
+
+    for r in rows:
+
+        if r.get("doctor_name") == doctor and r.get("status") == "FREE":
+
+            d = r.get("date")
+
+            if d not in result:
+
+                result.append(d)
+
+    return result
+
+# -------------------------
+# TIMES
+# -------------------------
+
+def times(doctor, date):
+
+    rows = records(SHEET_SCHEDULE)
+
+    result = []
+
+    for r in rows:
+
+        if r.get("doctor_name") == doctor and r.get("date") == date and r.get("status") == "FREE":
+
+            result.append(r)
+
+    return result
+
+# -------------------------
+# BOOK SLOT
+# -------------------------
+
+def book(slot_id, name, phone):
+
+    ws = sheet(SHEET_SCHEDULE)
+
+    rows = ws.get_all_records()
+
+    for i, r in enumerate(rows, start=2):
+
+        if str(r["slot_id"]) == str(slot_id) and r["status"] == "FREE":
+
+            ws.update_cell(i,8,"BOOKED")
+            ws.update_cell(i,9,name)
+            ws.update_cell(i,10,phone)
+
+            return True
+
+    return False
+
+# -------------------------
+# MENU CLICK
+# -------------------------
 
 async def menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     q = update.callback_query
     await q.answer()
 
-    if q.data == "record":
+    data = q.data
 
-        slots = free_slots()
+    if data == "contacts":
 
-        if not slots:
+        addr = info("clinic_address")
+        phone = info("clinic_phone")
+        hours = info("clinic_hours")
 
-            await q.message.reply_text("Свободных слотов нет")
-            return
+        await q.message.reply_text(
+
+f"""📍 РГ Клиник
+
+Адрес: {addr}
+Телефон: {phone}
+Режим работы: {hours}
+"""
+        )
+
+    if data == "record":
+
+        docs = doctors()
 
         kb = []
 
-        for s in slots[:10]:
+        for d in docs:
 
-            txt = f"{s['doctor_name']} {s['date']} {s['time']}"
-
-            kb.append(
-                [InlineKeyboardButton(txt, callback_data=f"slot_{s['slot_id']}")]
-            )
+            kb.append([InlineKeyboardButton(d,callback_data=f"doc_{d}")])
 
         await q.message.reply_text(
-            "Выберите время",
+            "Выберите врача",
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
+# -------------------------
+# DOCTOR CLICK
+# -------------------------
+
+async def doctor_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    q = update.callback_query
+    await q.answer()
+
+    doctor = q.data.replace("doc_","")
+
+    context.user_data["doctor"] = doctor
+
+    ds = dates(doctor)
+
+    kb = []
+
+    for d in ds:
+
+        kb.append([InlineKeyboardButton(d,callback_data=f"date_{d}")])
+
+    await q.message.reply_text(
+        "Выберите дату",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+# -------------------------
+# DATE CLICK
+# -------------------------
+
+async def date_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    q = update.callback_query
+    await q.answer()
+
+    date = q.data.replace("date_","")
+
+    context.user_data["date"] = date
+
+    doctor = context.user_data["doctor"]
+
+    ts = times(doctor,date)
+
+    kb = []
+
+    for t in ts:
+
+        txt = t["time"]
+
+        kb.append([
+            InlineKeyboardButton(
+                txt,
+                callback_data=f"slot_{t['slot_id']}"
+            )
+        ])
+
+    await q.message.reply_text(
+        "Выберите время",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+# -------------------------
+# SLOT CLICK
+# -------------------------
 
 async def slot_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     q = update.callback_query
     await q.answer()
 
-    slot_id = q.data.replace("slot_","")
-
-    context.user_data["slot"] = slot_id
+    context.user_data["slot"] = q.data.replace("slot_","")
 
     await q.message.reply_text("Введите ФИО")
 
+# -------------------------
+# TEXT
+# -------------------------
 
 async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -80,12 +329,11 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-
     if "slot" in context.user_data and "phone" not in context.user_data:
 
         context.user_data["phone"] = update.message.text
 
-        ok = book_slot(
+        ok = book(
             context.user_data["slot"],
             context.user_data["name"],
             context.user_data["phone"]
@@ -93,13 +341,13 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if ok:
 
-            await update.message.reply_text("Вы записаны")
+            await update.message.reply_text("✅ Вы записаны")
 
             if ADMIN_ID:
 
                 await context.bot.send_message(
                     ADMIN_ID,
-                    f"""
+f"""
 Новая запись
 
 Пациент: {context.user_data['name']}
@@ -111,13 +359,25 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
+    text = update.message.text.lower()
 
-    ai = ai_answer(update.message.text)
+    medical_words = [
+        "анализ",
+        "врач",
+        "узи",
+        "клиник",
+        "прием"
+    ]
 
-    if ai:
+    if not any(w in text for w in medical_words):
 
-        await update.message.reply_text(ai)
+        await update.message.reply_text(
+            "Я помогаю только по вопросам клиники."
+        )
 
+# -------------------------
+# MAIN
+# -------------------------
 
 def main():
 
@@ -125,11 +385,25 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
 
-    app.add_handler(CallbackQueryHandler(menu_click, pattern="record"))
+    app.add_handler(
+        CallbackQueryHandler(menu_click,pattern="^(record|contacts)$")
+    )
 
-    app.add_handler(CallbackQueryHandler(slot_click, pattern="slot_"))
+    app.add_handler(
+        CallbackQueryHandler(doctor_click,pattern="^doc_")
+    )
 
-    app.add_handler(MessageHandler(filters.TEXT, text))
+    app.add_handler(
+        CallbackQueryHandler(date_click,pattern="^date_")
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(slot_click,pattern="^slot_")
+    )
+
+    app.add_handler(
+        MessageHandler(filters.TEXT,text)
+    )
 
     print("Bot started")
 
