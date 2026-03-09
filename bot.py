@@ -89,13 +89,16 @@ back_menu = ReplyKeyboardMarkup(
 def norm(value) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
+
 def slug(value) -> str:
     text = norm(value).lower().replace("ё", "е")
     return re.sub(r"[^a-zа-я0-9]+", "", text)
 
+
 def valid_phone(value: str) -> bool:
     digits = re.sub(r"\D+", "", value or "")
     return 10 <= len(digits) <= 15
+
 
 def get_info_value(key: str) -> str:
     rows = sheet_info.get_all_records()
@@ -106,12 +109,14 @@ def get_info_value(key: str) -> str:
             return v
     return ""
 
+
 def safe_records(ws):
     try:
         return ws.get_all_records()
     except Exception as e:
         logger.exception("Ошибка чтения листа: %s", e)
         return []
+
 
 def get_schedule_rows():
     values = sheet_schedule.get_all_values()
@@ -162,16 +167,36 @@ def get_schedule_rows():
 
     return parsed, idx
 
+
 def free_slots():
     rows, _ = get_schedule_rows()
     return [r for r in rows if r["status"] == "FREE"]
 
+
 def doctors_with_free_slots():
     result = []
+    seen = set()
+
     for slot in free_slots():
-        if slot["doctor"] not in result:
-            result.append(slot["doctor"])
+        key = (slot["doctor"], slot["specialty"])
+        if key not in seen:
+            seen.add(key)
+            result.append({
+                "doctor": slot["doctor"],
+                "specialty": slot["specialty"],
+            })
+
     return result
+
+
+def booking_in_progress(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return bool(
+        context.user_data.get("doctor_list")
+        or context.user_data.get("doctor_slots")
+        or context.user_data.get("selected_slot")
+        or context.user_data.get("patient_name")
+    )
+
 
 def search_own_prep(query: str):
     rows = safe_records(sheet_prep)
@@ -201,6 +226,7 @@ def search_own_prep(query: str):
         return best
     return None
 
+
 def first_prices(limit=15):
     rows = safe_records(sheet_prices)
     result = []
@@ -211,6 +237,7 @@ def first_prices(limit=15):
         if name:
             result.append({"code": code, "name": name, "price": price})
     return result[:limit]
+
 
 def doctors_text():
     rows = safe_records(sheet_doctors)
@@ -251,6 +278,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, reply_markup=menu)
 
+
 async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = get_info_value("clinic_address")
     phone = get_info_value("clinic_phone")
@@ -269,8 +297,10 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(parts), reply_markup=menu)
 
+
 async def doctors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(doctors_text(), reply_markup=menu)
+
 
 async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = first_prices(15)
@@ -298,6 +328,7 @@ async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(parts), reply_markup=menu)
 
+
 async def prep_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Напишите название исследования или услуги РГ Клиник.\n"
@@ -305,6 +336,7 @@ async def prep_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=back_menu,
     )
     return PREP_QUERY
+
 
 async def prep_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = norm(update.message.text)
@@ -329,6 +361,7 @@ async def prep_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+
 async def booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         doctor_list = doctors_with_free_slots()
@@ -347,17 +380,24 @@ async def booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    context.user_data.clear()
     context.user_data["doctor_list"] = doctor_list
-    keyboard = [
-        [InlineKeyboardButton(doc, callback_data=f"book_doctor|{i}")]
-        for i, doc in enumerate(doctor_list[:30])
-    ]
+
+    keyboard = []
+    for i, item in enumerate(doctor_list[:30]):
+        label = item["doctor"]
+        if item["specialty"]:
+            label += f" — {item['specialty']}"
+        keyboard.append(
+            [InlineKeyboardButton(label[:64], callback_data=f"book_doctor|{i}")]
+        )
 
     await update.message.reply_text(
-        "Выберите врача:",
+        "Выберите врача и специальность:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return BOOK_DOCTOR
+
 
 async def choose_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -365,17 +405,24 @@ async def choose_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         idx = int(query.data.split("|")[1])
-        doctor = context.user_data["doctor_list"][idx]
+        selected = context.user_data["doctor_list"][idx]
+        doctor = selected["doctor"]
+        specialty = selected["specialty"]
     except Exception:
         await query.edit_message_text("Не удалось определить врача. Начните запись заново.")
         return ConversationHandler.END
 
-    slots = [s for s in free_slots() if s["doctor"] == doctor]
+    slots = [
+        s for s in free_slots()
+        if s["doctor"] == doctor and s["specialty"] == specialty
+    ]
+
     if not slots:
         await query.edit_message_text("У выбранного врача нет свободных слотов.")
         return ConversationHandler.END
 
     context.user_data["selected_doctor"] = doctor
+    context.user_data["selected_specialty"] = specialty
     context.user_data["doctor_slots"] = slots
 
     keyboard = [
@@ -383,11 +430,17 @@ async def choose_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, s in enumerate(slots[:30])
     ]
 
+    text = f"Врач: {doctor}"
+    if specialty:
+        text += f"\nСпециальность: {specialty}"
+    text += "\nВыберите время:"
+
     await query.edit_message_text(
-        f"Врач: {doctor}\nВыберите время:",
+        text,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return BOOK_SLOT
+
 
 async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -402,16 +455,21 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["selected_slot"] = slot
 
-    await query.edit_message_text(
-        f"Вы выбрали:\n{slot['doctor']}\n{slot['date']} {slot['time']}\n\nВведите ФИО пациента."
-    )
+    text = f"Вы выбрали:\nВрач: {slot['doctor']}"
+    if slot["specialty"]:
+        text += f"\nСпециальность: {slot['specialty']}"
+    text += f"\nДата: {slot['date']}\nВремя: {slot['time']}\n\nВведите ФИО пациента."
+
+    await query.edit_message_text(text)
     return BOOK_NAME
+
 
 async def booking_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = norm(update.message.text)
 
     if text == MENU_BACK:
         await update.message.reply_text("Возвращаю в главное меню.", reply_markup=menu)
+        context.user_data.clear()
         return ConversationHandler.END
 
     if len(text) < 5:
@@ -422,11 +480,13 @@ async def booking_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введите телефон пациента:", reply_markup=back_menu)
     return BOOK_PHONE
 
+
 async def booking_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = norm(update.message.text)
 
     if text == MENU_BACK:
         await update.message.reply_text("Возвращаю в главное меню.", reply_markup=menu)
+        context.user_data.clear()
         return ConversationHandler.END
 
     if not valid_phone(text):
@@ -438,6 +498,7 @@ async def booking_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not selected_slot:
         await update.message.reply_text("Слот не найден. Начните запись заново.", reply_markup=menu)
+        context.user_data.clear()
         return ConversationHandler.END
 
     try:
@@ -446,13 +507,14 @@ async def booking_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not fresh_slot:
             await update.message.reply_text("Слот не найден в расписании. Попробуйте снова.", reply_markup=menu)
+            context.user_data.clear()
             return ConversationHandler.END
 
         if fresh_slot["status"] != "FREE":
             await update.message.reply_text("Это время уже занято. Пожалуйста, выберите другой слот.", reply_markup=menu)
+            context.user_data.clear()
             return ConversationHandler.END
 
-        # A:H = 8 столбцов
         sheet_schedule.update(
             f"A{fresh_slot['row_num']}:H{fresh_slot['row_num']}",
             [[
@@ -483,28 +545,47 @@ async def booking_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if ADMIN_CHAT_ID:
             try:
+                admin_text = (
+                    "📥 Новая запись\n"
+                    f"Пациент: {patient_name}\n"
+                    f"Телефон: {text}\n"
+                    f"Врач: {fresh_slot['doctor']}\n"
+                )
+
+                if fresh_slot["specialty"]:
+                    admin_text += f"Специальность: {fresh_slot['specialty']}\n"
+
+                admin_text += (
+                    f"Дата: {fresh_slot['date']}\n"
+                    f"Время: {fresh_slot['time']}"
+                )
+
                 await context.bot.send_message(
                     chat_id=int(ADMIN_CHAT_ID),
-                    text=(
-                        "📥 Новая запись\n"
-                        f"Пациент: {patient_name}\n"
-                        f"Телефон: {text}\n"
-                        f"Врач: {fresh_slot['doctor']}\n"
-                        f"Дата: {fresh_slot['date']}\n"
-                        f"Время: {fresh_slot['time']}"
-                    ),
+                    text=admin_text,
                 )
             except Exception as e:
                 logger.warning("Не удалось отправить уведомление админу: %s", e)
 
-        await update.message.reply_text(
+        text_confirm = (
             "✅ Запись оформлена.\n"
             f"Врач: {fresh_slot['doctor']}\n"
+        )
+
+        if fresh_slot["specialty"]:
+            text_confirm += f"Специальность: {fresh_slot['specialty']}\n"
+
+        text_confirm += (
             f"Дата: {fresh_slot['date']}\n"
             f"Время: {fresh_slot['time']}\n\n"
-            "Справочно: при необходимости администратор свяжется с вами.",
+            "Справочно: при необходимости администратор свяжется с вами."
+        )
+
+        await update.message.reply_text(
+            text_confirm,
             reply_markup=menu,
         )
+
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -514,7 +595,9 @@ async def booking_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Не удалось завершить запись. Пожалуйста, попробуйте ещё раз или свяжитесь с администратором.",
             reply_markup=menu,
         )
+        context.user_data.clear()
         return ConversationHandler.END
+
 
 async def answer_info_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = slug(update.message.text)
@@ -545,8 +628,17 @@ async def answer_info_question(update: Update, context: ContextTypes.DEFAULT_TYP
 
     return False
 
+
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = norm(update.message.text)
+
+    if booking_in_progress(context) and text in [MENU_DOCTORS, MENU_PRICES, MENU_CONTACTS, MENU_BOOK]:
+        await update.message.reply_text(
+            "Сейчас у вас идет запись.\n"
+            "Завершите её или нажмите ↩️ В меню.",
+            reply_markup=back_menu,
+        )
+        return
 
     if text == MENU_DOCTORS:
         await doctors(update, context)
@@ -569,10 +661,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=menu,
     )
 
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Действие отменено.", reply_markup=menu)
     return ConversationHandler.END
+
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error: %s", context.error)
@@ -584,6 +678,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception:
         logger.exception("Не удалось отправить сообщение об ошибке")
+
 
 def main():
     app = Application.builder().token(TOKEN).build()
@@ -627,6 +722,7 @@ def main():
 
     logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
